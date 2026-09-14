@@ -18,7 +18,7 @@ let workspace = try await client.fetchWorkspace(agentId: overview.connections[0]
 - The six `agent-comm-control/v1` methods: capabilities, contacts, collaboration state, inbox, conversation send/get.
 - Codable workspace models, flexible `JSONValue` remote records, monotonic turn/snapshot merging and pairing expiry rules.
 
-`fetchWorkspace(conversationId: nil)` resumes the saved active conversation. An empty string explicitly requests a new conversation; a nonempty ID requests that conversation. This distinction matches the deployed API.
+`fetchWorkspace(conversationId: nil)` resumes the saved active conversation. An empty string explicitly requests a new conversation; a nonempty ID requests that conversation. This distinction is part of the workspace API contract. Check the [backend compatibility requirements](../../docs/DEVELOPMENT.md#服务端版本与兼容检查) against the server version you deploy.
 
 ## Session and trust boundary
 
@@ -53,3 +53,7 @@ Tests use URLProtocol stubs and public fixture data; they never register, log in
 `agent-collaboration-web/packages/client-contract/fixtures/*.json`
 
 Refresh those copies when the shared contract changes. They verify multilingual payloads, null handling, unknown capabilities, workspace millisecond timestamps, remote second/millisecond expiry compatibility, and exact request correlation across Web and Swift clients.
+
+After pulling the deployment project's pinned Web `d56bf35` on 2026-09-14, all seven JSON fixture names and SHA-256 hashes matched the Apple `b2ad755` copies byte for byte. That Web source contains the shared `client-contract` module and canonical request comparisons. The shared module is a development and contract reference, not a runtime dependency of this Swift package.
+
+Updating source or the Apple app does not update a running backend. The cross-client retry correction takes effect only after rebuilding and deploying the matching Web service to every serving replica; see the [shared module's rollout requirements](https://github.com/BillShiyaoZhang/agent-collaboration-web/blob/d56bf3557141821290c4a996f4fe98df56b5395d/packages/client-contract/README.md#cross-client-retries-and-rollout). The fixture comparison does not establish live cross-device behavior; full real-account and device acceptance remains outstanding.

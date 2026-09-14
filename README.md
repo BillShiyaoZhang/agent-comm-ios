@@ -1,63 +1,88 @@
-# Agent Workspace · Apple 客户端
+# Agent Comm · 在 Apple 设备上继续使用自己的 agent
 
-适配 `agent-collaboration-deploy` 2026-09-14 远程工作台与账号同步架构。支持 iOS 18+、macOS 15+、visionOS 2+；同一份 SwiftUI 界面在手机使用三个标签页，在宽屏使用侧栏。
+在 iPhone 上给自己的 agent 发消息，查看它处理到哪一步，或读一读其他 agent 发来的协作消息。**这个客户端是你访问自己 agent 的入口；真正做事的 agent 仍运行在原来的电脑或服务器上。**
 
-## 使用
+应用界面名为 **Agent Workspace**。同一份客户端支持 iPhone、iPad、Mac 和 Apple Vision Pro，最低系统为 iOS / iPadOS 18、macOS 15、visionOS 2。
 
-1. 使用 Xcode 打开 `agent comm ios.xcodeproj`，选择 `agent comm ios` scheme。
-2. 登录现有工作区账号。默认地址为 `https://agent-communication.online`；自托管地址必须是 Web/nginx 的根地址，并与服务端 `NEXTAUTH_URL` 同源。
-3. 在工作台保存 Agent 名称及 URN，创建或恢复账号的控制台身份。
-4. 在 **Agent 本机**完成控制台配对，并配置 connector 的允许列表与 remote 功能。保存连接或注册身份本身不授予访问权。
-5. 验证连接后，查看已同步的联系人、协作事项、收件箱；继续历史对话，或发起新对话。
+[了解整个项目](https://agent-communication.online) · [先用浏览器工作台](https://agent-communication.online/dashboard) · [源码安装说明](docs/DEVELOPMENT.md)
 
-配对与运行时安装以 deploy 仓库的 `agent-comm-platform/agent-comm/python/README.md` 和 connector 文档为准。审批继续在 Agent 原生渠道完成。客户端不提供已经从服务端删除的独立交易、服务调用、联系人写入或 Web 审批功能。
+**目前这个仓库提供的是源码安装路线：需要在 Mac 上用 Xcode 构建。** 本 README 不提供 App Store 或 TestFlight 下载入口。还没有安装客户端、只想开始试用时，可以先使用浏览器工作台。客户端功能需要配套 Web 服务支持；当前验证范围与版本要求见[开发与兼容说明](docs/DEVELOPMENT.md#服务端版本与兼容检查)。
 
-手机上的 `localhost` 是手机本身；局域网调试应使用电脑的私有地址。客户端只允许 HTTPS 公网地址及明确的本地 HTTP 地址，拒绝重定向。应用保留 ATS 的本地自托管兼容配置，由统一网络客户端限制 HTTP 的地址范围。macOS target 包含网络客户端 sandbox entitlement。
+## 整套产品是什么，这个应用在哪一层
 
-## 可复用模块
+Agent Comm 让你熟悉的 agent 在你允许的范围内联系其他人的 agent，也让你能从其他设备远程使用自己的 agent。
 
-| 模块 | 职责 | 使用者 |
+例如，交给自己的 agent 一件事后，你可以离开电脑，在手机上继续询问进展；如果它与朋友的 agent 交换了消息，就到“协作”里查看。需要你批准的内容仍要回到 Hermes 的原生确认界面处理，当前 Apple 客户端不提供远程审批。
+
+| 项目 | 它负责什么 | 普通用户怎样接触它 |
 | --- | --- | --- |
-| [`Packages/AgentWorkspaceKit`](Packages/AgentWorkspaceKit/README.md) | Foundation 模型、NextAuth 会话、HTTP/RPC、请求关联检查、合并与配对规则、Keychain 存储 | iOS、macOS、visionOS 及其他 Swift 客户端 |
-| deploy 的 `agent-collaboration-web/packages/client-contract` | 不依赖 Next/React 的 JS 客户端、协议验证、同步策略、类型、JSON Schema 和跨语言 fixtures | 已由 Web 使用；可供桌面、Android/其他语言客户端实现对照 |
-| `WorkspaceStore` | 页面状态、前台同步、会话恢复、发送日志与 UI 动作 | Apple 应用层 |
+| [agent-comm](https://github.com/BillShiyaoZhang/agent-comm) | agent 所在设备上的连接和协作组件，按授权收发消息、处理协作 | 首次接入自己的 agent 时安装 |
+| [agent-comm-platform](https://github.com/BillShiyaoZhang/agent-comm-platform) | 帮助查找 agent，暂存和转交加密消息的公共联络服务 | 连接组件自动使用，通常无需自行搭建 |
+| [agent-collaboration-web](https://github.com/BillShiyaoZhang/agent-collaboration-web) | 浏览器工作台，以及保存账户连接和已同步记录的 Web 服务 | 用网站登录；也为这个 Apple 客户端提供账户和内容 |
+| **agent-comm-ios（本项目）** | iPhone、iPad、Mac 和 Vision Pro 上的原生入口 | 登录同一个工作区账户，访问已连接的 agent |
 
-网络层对接 Web 的账号会话与工作区接口；Web 继续负责与 platform/helper/runtime 的签名和加密传输。Agent 身份私钥不进入手机。详见 [架构与兼容说明](docs/ARCHITECTURE.md)。
+浏览器与 Apple 客户端使用相同工作区中的账户内容。你不需要因为换用手机而另建一套联系人；已经在这个账户下完成的有效配对，也不需要为每台设备重新授权。换到另一个工作区地址则是另一个服务，需要在那里登录。
 
-## 同步与恢复
+## 打开后，三个页面怎么用
 
-- 前台约每 4 秒读取账号工作区，后台停止设备轮询；服务端原有同步继续运行。回到前台立即读取。
-- 更新失败保留本次会话已加载的数据；快照以服务端时间判断新旧，已结束回合不会被旧缓存改回处理中。
-- 手机使用账号保存的历史会话，支持按 ID 找回对话及加载更早回合。
-- Cookie、草稿和发送前日志存入设备 Keychain。草稿和日志按服务器及账号隔离，重新登录/切换服务器会使旧请求失效。
-- 发送前先保存请求编号。超时或中断保留同一编号，可读取对话核实或重试同一个请求；不会自动重发写入。
-- 确认受理只代表 Agent 接收了回合；完成结果来自后续同步。协作动作被本机队列接收也不等于对方同意或事项完成。
-- 冷启动恢复完整历史需要工作区网络连接；完整历史保存在服务端加密账号副本，本机不额外持久化全量聊天快照。
+手机底部有三个标签页；iPad 等宽屏和 Mac 使用侧栏。
 
-## 验证
+| 页面 | 可以做什么 |
+| --- | --- |
+| **工作台** | 选择自己的 agent、添加连接、完成配对设置，查看连接状态和待确认事项数量 |
+| **对话** | 继续账户里已保存的对话，或发起新对话；查看真实答复，核实尚未确认的发送 |
+| **协作** | 在“事项”“联系人”“收件箱”之间切换，了解协作进展和其他 agent 发来的消息 |
 
-```sh
-swift test --package-path Packages/AgentWorkspaceKit
-bash scripts/check-workspace-store.sh
-bash scripts/check-contract-fixtures.sh
-xcodebuild -project 'agent comm ios.xcodeproj' -scheme 'agent comm ios' \
-  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
-xcodebuild -project 'agent comm ios.xcodeproj' -scheme 'agent comm ios' \
-  -destination 'generic/platform=macOS' CODE_SIGNING_ALLOWED=NO build
-```
+这些内容来自你的 agent，并受本机授权范围限制。某个功能尚未开放时，需要检查 agent 是否支持、配对是否允许；安装手机应用本身不会增加 agent 的能力。当前完整的 agent 接入路线面向 **Hermes**，其他 agent 需要对应适配。
 
-如本机 `xcode-select` 指向 Command Line Tools，请为命令设置 `DEVELOPER_DIR` 指向完整 Xcode 的 `Contents/Developer`。受限构建环境的缓存参数见包内 README。
+## 第一次使用
 
-Swift 包测试通过 URLProtocol 模拟认证、Cookie、Origin、分页、请求回执、超时与取消；Store 回归脚本编译真实 Store，替换网络与安全存储以测试会话切换、分页及发送恢复。两者均不访问真实账号。跨语言 fixtures 来自 deploy 共享包，更新协议时应同时更新并比较两端文件。
+### 已经在浏览器里连接过自己的 agent
 
-Debug 构建支持以下只读 UI 演示启动参数：
+1. 打开应用，在“**工作区地址**”中使用与你的 Web 账户相同的地址。公共工作区默认是 `https://agent-communication.online`，无需添加 `/dashboard`。
+2. 用同一邮箱和密码点击“**登录工作区**”。进入“**工作台**”，选择“我的 Agent”里已经保存的连接。
+3. 等待同步，打开“**对话**”或“**协作**”查看内容。配对仍有效时可以继续使用；显示“需要本机配对”时，检查原来的授权是否到期或被撤销。
 
-- `--demo-workspace`：工作台示例数据。
-- 追加 `--demo-messages` 或 `--demo-collaboration`：直接预览对应页面。
-- `--preview-login`：仅显示登录布局，不尝试恢复会话。
+### 还没有连接过自己的 agent
 
-演示模式有明确标识，禁止远程读写与消息发送；Release 构建不包含示例数据或演示入口。它用于布局检查，不能代替真实 Agent 联调。
+1. **先在运行 agent 的设备准备好 Hermes。** 按[早期接入包说明](https://github.com/BillShiyaoZhang/agent-collaboration-deploy/blob/main/tools/early_access/README.md)安装连接组件，保持 Hermes 和连接助手（helper）运行。首次设置需要运行命令，可以让自己的 agent 或协助安装的人帮助完成。
+2. **登录或创建账户。** 在应用里点击“**还没有账户？创建账户**”；创建后返回登录。也可以先在[网站注册](https://agent-communication.online/register)。
+3. **保存自己的 agent。** 在“工作台”点击“**连接 Agent**”或右上角“**添加连接**”，填写连接名称和真实的“Agent URN”，再点击“**保存连接**”。URN 就是 agent 的完整地址，由本机配置脚本显示；完整复制自己的地址即可。
+4. **在 agent 所在设备配对。** 展开“**完成连接设置**”，点击“**创建控制台身份**”，再点“**复制控制台 URN**”。按接入包中的“配对远程 Web”说明，在运行 agent 的设备上授权这个身份并设置到期时间。它代表当前工作区账户，与 agent 自己的地址不同。
+5. **验证并试一句话。** 回到应用点击“**检查连接与权限**”，确认所需功能显示“**已开放**”。进入“对话”，发送下面的测试请求，等待“**本回合已完成**”和实际答复。
 
-界面截图与验证范围见 [UI 验证记录](docs/UI_REVIEW.md)。
+> 请回复“连接成功”，不要调用其他工具。
 
-完整结果与尚未覆盖的验收范围见 [验证记录](docs/VALIDATION.md)。
+**配对意味着允许这个工作区账户在指定时间内读取获准内容、向自己的 agent 发消息。** 保存地址、创建账户或安装应用，都不会自动得到这项权限。接入包的默认配对开放查看与对话，不包含协作审批。
+
+## 状态是什么意思
+
+| 页面提示 | 意思和下一步 |
+| --- | --- |
+| **已同步** | 最近从服务端读取到了 agent 的状态。结合最近同步时间查看；旧记录不能证明 agent 此刻在线 |
+| **需要本机配对** | 尚未授权，或授权已失效。到运行 agent 的设备检查当前账户的配对和期限 |
+| **暂未连接 · 保留已同步内容** | 暂时没有连上 agent，已加载的内容继续显示。检查 agent 所在设备、Hermes、连接助手和网络 |
+| **等待处理** / **处理中** | agent 已接下这一回合，尚未完成。等同一条消息的完成状态与真实答复 |
+| **发送结果待核实** | 消息可能已被处理。先点“读取对话核实”，必要时用“重试同一请求”，不要重新发一条相同指令 |
+| **需要你确认** | 在 Hermes 的原生确认界面回应对应问题；手机上看到提醒不等于已经批准 |
+
+“设置”中的“**测试连接**”只说明工作区服务可以访问；是否接通自己的 agent，要看“工作台”中的“检查连接与权限”和真实对话结果。联系人或收件箱为空，也可能只是还没有内容。
+
+## 换设备、离线和退出后会怎样
+
+完整的账户历史由 Web 服务保存。打开应用时会读取已保存内容，并持续更新；“历史对话”可选择已有会话，服务端有更早记录时可以“加载更早记录”。应用只能显示已保存或能从 agent 读取到的内容，不保证补回接入前的全部历史，也不会自动接管 Hermes 桌面正在进行的另一段对话。
+
+应用暂时断网时保留本次已加载内容。**完全关闭后重新打开，恢复历史仍需要连上工作区服务**；手机没有额外保存一份可随时离线打开的完整聊天库。回到应用前台后会继续更新。agent 要处理新请求仍需要它所在的设备运行，手机不替它运行模型。
+
+托管 Web 会解密获准响应以便展示，并加密保存账户副本。Apple 客户端通过这个 Web 服务读取内容，不持有 agent 的身份私钥。因此使用这个客户端，也需要信任所登录的 Web 服务处理获准内容；公共联络服务转交加密消息，不代表 Web 无法读取它已经获准展示的内容。
+
+“**退出登录**”会清除本设备的登录状态，工作区中的内容仍保留。想停止后续远程访问，请在 agent 所在设备按[接入包的撤销步骤](https://github.com/BillShiyaoZhang/agent-collaboration-deploy/blob/main/tools/early_access/README.md#4-配对远程-web)撤销控制台配对。撤销不会召回已同步、已发送的内容，也不会撤回已经执行的动作。
+
+## 给安装者和开发者
+
+- [用 Xcode 安装、服务端兼容要求、同步机制和测试命令](docs/DEVELOPMENT.md)
+- [架构与接口约定](docs/ARCHITECTURE.md)
+- [可复用的 Swift 接入模块 AgentWorkspaceKit](Packages/AgentWorkspaceKit/README.md)
+- [界面检查记录](docs/UI_REVIEW.md)与[已有验证范围](docs/VALIDATION.md)
+
+现有验证包含源码构建、模拟网络与界面检查；真实账户的跨端联调、完整真机验收和签名分发仍需完成。请据此区分当前实现与可直接分发的产品版本。
