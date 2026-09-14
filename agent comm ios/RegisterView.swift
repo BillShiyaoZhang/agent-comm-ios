@@ -1,230 +1,149 @@
 import SwiftUI
 
 struct RegisterView: View {
-    @Environment(\.presentationMode) var presentationMode
-    @ObservedObject var networkManager = NetworkManager.shared
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var networkManager = NetworkManager.shared
+    var serverURL: String? = nil
+    @State private var serverUrl = ""
     @State private var email = ""
     @State private var password = ""
     @State private var confirmPassword = ""
     @State private var isLoading = false
-    @State private var successMessage = ""
-    @State private var errorMessage = ""
-    
+    @State private var didRegister = false
+    @State private var errorMessage: String?
+    @FocusState private var focusedField: Field?
+
+    private enum Field { case server, email, password, confirmation }
+
     var body: some View {
-        ZStack {
-            PremiumBackground()
-            
-            ScrollView {
-                VStack(spacing: 24) {
-                    Spacer().frame(height: 20)
-                    
-                    // Title section
-                    VStack(spacing: 8) {
-                        Text("Create Account")
-                            .font(.system(size: 32, weight: .bold, design: .rounded))
-                            .foregroundColor(.white)
-                        
-                        Text("Join Agent Collab Platform")
-                            .font(.subheadline)
-                            .foregroundColor(.white.opacity(0.6))
-                    }
-                    
-                    // Messages
-                    if !errorMessage.isEmpty {
-                        HStack {
-                            Image(systemName: "exclamationmark.circle.fill")
-                                .foregroundColor(.statusDestructive)
-                            Text(errorMessage)
-                                .font(.subheadline)
-                                .foregroundColor(.white)
-                            Spacer()
-                        }
-                        .padding()
-                        .background(Color.statusDestructive.opacity(0.15))
-                        .cornerRadius(12)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.statusDestructive.opacity(0.3), lineWidth: 1)
-                        )
-                        .padding(.horizontal)
-                    }
-                    
-                    if !successMessage.isEmpty {
-                        VStack(spacing: 16) {
-                            HStack {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundColor(.statusSuccess)
-                                Text(successMessage)
-                                    .font(.subheadline)
-                                    .bold()
-                                    .foregroundColor(.white)
-                                Spacer()
-                            }
-                            
-                            Button(action: {
-                                presentationMode.wrappedValue.dismiss()
-                            }) {
-                                Text("Back to Sign In")
-                                    .font(.subheadline)
-                                    .bold()
-                            }
-                            .buttonStyle(PremiumButtonStyle(backgroundColor: .brandSecondary))
-                        }
-                        .padding()
-                        .background(Color.statusSuccess.opacity(0.15))
-                        .cornerRadius(12)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.statusSuccess.opacity(0.3), lineWidth: 1)
-                        )
-                        .padding(.horizontal)
-                    }
-                    
-                    if successMessage.isEmpty {
-                        // Registration Card
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                if didRegister {
+                    WorkspaceCard {
                         VStack(spacing: 20) {
-                            // Email Input
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("EMAIL ADDRESS")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundColor(.white.opacity(0.5))
-                                
+                            EmptyState(title: "账户已创建", message: "请使用新账户登录这个工作区。", systemImage: "checkmark.circle")
+                            Button("返回登录") { dismiss() }
+                                .buttonStyle(WorkspacePrimaryButtonStyle())
+                        }
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("开始协作")
+                            .font(.largeTitle.bold())
+                        Text("在你的工作区中创建一个账户。")
+                            .foregroundStyle(.secondary)
+                    }
+                    if let errorMessage {
+                        InlineNotice(message: errorMessage, style: .error)
+                    }
+                    WorkspaceCard {
+                        VStack(alignment: .leading, spacing: 20) {
+                            WorkspaceField(title: "工作区地址") {
+                                TextField("https://workspace.example.com", text: $serverUrl)
+                                    .crossPlatformKeyboardType(.url)
+                                    .crossPlatformAutocapitalization()
+                                    .autocorrectionDisabled()
+                                    .workspaceInputStyle()
+                                    .focused($focusedField, equals: .server)
+                                    .submitLabel(.next)
+                                    .onSubmit { focusedField = .email }
+                            }
+                            WorkspaceField(title: "邮箱") {
                                 TextField("you@example.com", text: $email)
+                                    .textContentType(.username)
                                     .crossPlatformKeyboardType(.emailAddress)
                                     .crossPlatformAutocapitalization()
-                                    .disableAutocorrection(true)
-                                    .foregroundColor(.white)
-                                    .padding()
-                                    .background(Color.white.opacity(0.08))
-                                    .cornerRadius(10)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                    )
+                                    .autocorrectionDisabled()
+                                    .workspaceInputStyle()
+                                    .focused($focusedField, equals: .email)
+                                    .submitLabel(.next)
+                                    .onSubmit { focusedField = .password }
                             }
-                            
-                            // Password Input
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("PASSWORD")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundColor(.white.opacity(0.5))
-                                
-                                SecureField("Minimum 8 characters", text: $password)
-                                    .foregroundColor(.white)
-                                    .padding()
-                                    .background(Color.white.opacity(0.08))
-                                    .cornerRadius(10)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                    )
+                            WorkspaceField(title: "密码", hint: "至少 8 个字符。") {
+                                SecureField("设置账户密码", text: $password)
+                                    .textContentType(.newPassword)
+                                    .workspaceInputStyle()
+                                    .focused($focusedField, equals: .password)
+                                    .submitLabel(.next)
+                                    .onSubmit { focusedField = .confirmation }
                             }
-                            
-                            // Confirm Password Input
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("CONFIRM PASSWORD")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundColor(.white.opacity(0.5))
-                                
-                                SecureField("••••••••", text: $confirmPassword)
-                                    .foregroundColor(.white)
-                                    .padding()
-                                    .background(Color.white.opacity(0.08))
-                                    .cornerRadius(10)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                    )
+                            WorkspaceField(title: "确认密码") {
+                                SecureField("再次输入密码", text: $confirmPassword)
+                                    .textContentType(.newPassword)
+                                    .workspaceInputStyle()
+                                    .focused($focusedField, equals: .confirmation)
+                                    .submitLabel(.go)
+                                    .onSubmit(handleRegister)
                             }
-                            
-                            // Register Button
                             Button(action: handleRegister) {
-                                HStack {
-                                    if isLoading {
-                                        ProgressView()
-                                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                                            .padding(.trailing, 8)
-                                    }
-                                    Text(isLoading ? "Creating Account..." : "Create Account")
-                                        .bold()
+                                HStack(spacing: 8) {
+                                    if isLoading { ProgressView().tint(.white) }
+                                    Text(isLoading ? "正在创建…" : "创建账户")
                                 }
                             }
-                            .buttonStyle(PremiumButtonStyle(backgroundColor: .brandSecondary, isDisabled: isLoading))
-                            .disabled(isLoading)
+                            .buttonStyle(WorkspacePrimaryButtonStyle())
                         }
-                        .padding(24)
-                        .glassCardStyle()
-                        .padding(.horizontal)
+                        .disabled(isLoading)
                     }
-                    
-                    // Back link
-                    Button(action: {
-                        presentationMode.wrappedValue.dismiss()
-                    }) {
-                        Text("Already have an account? Sign In")
-                            .font(.subheadline)
-                            .bold()
-                            .foregroundColor(.brandPrimary)
-                    }
-                    .padding(.top, 8)
-                    
-                    Spacer()
+                    Text("创建成功后返回登录。不同工作区的账户不会自动互通。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            .frame(maxWidth: 520)
+            .padding(24)
+            .frame(maxWidth: .infinity)
         }
+        .background(Color.listBackground)
+        .navigationTitle("创建账户")
         .crossPlatformNavigationBarTitleDisplayModeInline()
-        .navigationBarBackButtonHidden(true)
-        .crossPlatformToolbar(leading: AnyView(Button(action: {
-            presentationMode.wrappedValue.dismiss()
-        }) {
-            HStack {
-                Image(systemName: "chevron.left")
-                Text("Back")
-            }
-            .foregroundColor(.white)
-        }))
+        .onAppear {
+            if serverUrl.isEmpty { serverUrl = serverURL ?? networkManager.baseUrl }
+        }
     }
-    
+
     private func handleRegister() {
-        guard !email.isEmpty, !password.isEmpty, !confirmPassword.isEmpty else {
-            errorMessage = "Please fill in all fields"
+        guard !isLoading else { return }
+        let normalizedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedEmail.isEmpty else {
+            errorMessage = "请填写邮箱。"
+            focusedField = .email
             return
         }
-        
-        guard password == confirmPassword else {
-            errorMessage = "Passwords do not match"
-            return
-        }
-        
         guard password.count >= 8 else {
-            errorMessage = "Password must be at least 8 characters"
+            errorMessage = "密码需要至少 8 个字符。"
+            focusedField = .password
             return
         }
-        
-        errorMessage = ""
-        successMessage = ""
+        guard password == confirmPassword else {
+            errorMessage = "两次输入的密码不一致，请重新确认。"
+            focusedField = .confirmation
+            return
+        }
+        do {
+            try networkManager.configureServer(serverUrl)
+            serverUrl = networkManager.baseUrl
+        } catch {
+            errorMessage = error.localizedDescription
+            focusedField = .server
+            return
+        }
+        focusedField = nil
+        errorMessage = nil
         isLoading = true
-        
         Task {
+            defer { isLoading = false }
             do {
-                try await networkManager.register(email: email, password: password)
-                DispatchQueue.main.async {
-                    self.isLoading = false
-                    self.successMessage = "Account created successfully! Please sign in."
-                }
+                try await networkManager.register(email: normalizedEmail, password: password)
+                password = ""
+                confirmPassword = ""
+                didRegister = true
             } catch {
-                DispatchQueue.main.async {
-                    self.isLoading = false
-                    self.errorMessage = error.localizedDescription
-                }
+                errorMessage = error.localizedDescription
             }
         }
     }
 }
 
-struct RegisterView_Previews: PreviewProvider {
-    static var previews: some View {
-        RegisterView()
-            .preferredColorScheme(.dark)
-    }
-}
+#Preview { NavigationStack { RegisterView() } }

@@ -6,138 +6,155 @@ import UIKit
 import AppKit
 #endif
 
-// MARK: - Color Palette
 extension Color {
-    static let brandPrimary = Color(red: 0.36, green: 0.30, blue: 0.90) // Vibrant Indigo
-    static let brandSecondary = Color(red: 0.08, green: 0.70, blue: 0.75) // Teal
-    static let brandBackground = Color(red: 0.05, green: 0.05, blue: 0.10) // Deep Slate Black
-    static let glassBackground = Color.white.opacity(0.06)
-    
-    static let statusSuccess = Color(red: 0.18, green: 0.80, blue: 0.44) // Bright Emerald
-    static let statusWarning = Color(red: 0.95, green: 0.61, blue: 0.07) // Amber/Yellow
-    static let statusDestructive = Color(red: 0.90, green: 0.30, blue: 0.26) // Premium Red
-    
-    #if canImport(UIKit)
+    // Semantic surfaces support both appearance modes and system contrast settings.
+    #if os(macOS)
+    static let brandPrimary = Color(NSColor(name: nil) { appearance in
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return dark
+            ? NSColor(red: 0.30, green: 0.77, blue: 0.73, alpha: 1)
+            : NSColor(red: 0.02, green: 0.43, blue: 0.42, alpha: 1)
+    })
+    #else
+    static let brandPrimary = Color(UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.30, green: 0.77, blue: 0.73, alpha: 1)
+            : UIColor(red: 0.02, green: 0.43, blue: 0.42, alpha: 1)
+    })
+    #endif
+    static let brandButtonBackground = Color(red: 0.02, green: 0.43, blue: 0.42)
+    static let statusSuccess = adaptive(light: (0.04, 0.43, 0.27), dark: (0.34, 0.83, 0.58))
+    static let statusWarning = adaptive(light: (0.60, 0.32, 0.02), dark: (1.0, 0.73, 0.34))
+    static let statusDestructive = adaptive(light: (0.75, 0.15, 0.19), dark: (1.0, 0.46, 0.48))
+
+    private static func adaptive(light: (Double, Double, Double), dark: (Double, Double, Double)) -> Color {
+        #if os(macOS)
+        Color(NSColor(name: nil) { appearance in
+            let c = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+            return NSColor(red: c.0, green: c.1, blue: c.2, alpha: 1)
+        })
+        #else
+        Color(UIColor { traits in
+            let c = traits.userInterfaceStyle == .dark ? dark : light
+            return UIColor(red: c.0, green: c.1, blue: c.2, alpha: 1)
+        })
+        #endif
+    }
+
+    #if os(macOS)
+    static let systemGroupedBackground = Color(NSColor.windowBackgroundColor)
+    static let secondarySystemGroupedBackground = Color(NSColor.controlBackgroundColor)
+    static let systemBackground = Color(NSColor.windowBackgroundColor)
+    static let secondarySystemBackground = Color(NSColor.controlBackgroundColor)
+    #else
     static let systemGroupedBackground = Color(UIColor.systemGroupedBackground)
     static let secondarySystemGroupedBackground = Color(UIColor.secondarySystemGroupedBackground)
     static let systemBackground = Color(UIColor.systemBackground)
     static let secondarySystemBackground = Color(UIColor.secondarySystemBackground)
-    #else
-    static let systemGroupedBackground = Color(NSColor.windowBackgroundColor)
-    static let secondarySystemGroupedBackground = Color(NSColor.controlBackgroundColor)
-    static let systemBackground = Color(NSColor.windowBackgroundColor)
-    static let secondarySystemBackground = Color(NSColor.underPageBackgroundColor)
     #endif
-    
+
     static let cardBackground = secondarySystemGroupedBackground
     static let listBackground = systemGroupedBackground
 }
 
-// MARK: - Glassmorphic Card Style
-struct GlassCardModifier: ViewModifier {
-    var cornerRadius: CGFloat = 16
-    var borderColor: Color = Color.white.opacity(0.15)
-    
-    func body(content: Content) -> some View {
+struct WorkspaceCard<Content: View>: View {
+    private let content: Content
+    private let padding: CGFloat
+
+    init(padding: CGFloat = 18, @ViewBuilder content: () -> Content) {
+        self.padding = padding
+        self.content = content()
+    }
+
+    var body: some View {
         content
-            .background(
-                RoundedRectangle(cornerRadius: cornerRadius)
-                    .fill(Color.glassBackground)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius)
-                    .stroke(borderColor, lineWidth: 1)
-            )
-            .shadow(color: Color.black.opacity(0.2), radius: 8, x: 0, y: 4)
+            .padding(padding)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 18))
+            .overlay {
+                RoundedRectangle(cornerRadius: 18)
+                    .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+            }
     }
 }
 
-extension View {
-    func glassCardStyle(cornerRadius: CGFloat = 16, borderColor: Color = Color.white.opacity(0.15)) -> some View {
-        self.modifier(GlassCardModifier(cornerRadius: cornerRadius, borderColor: borderColor))
+struct WorkspaceField<Content: View>: View {
+    let title: String
+    let hint: String?
+    private let content: Content
+
+    init(title: String, hint: String? = nil, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.hint = hint
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.subheadline.weight(.semibold))
+            content.accessibilityLabel(title)
+            if let hint {
+                Text(hint)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
 
-// MARK: - Premium Button Style
-struct PremiumButtonStyle: ButtonStyle {
-    var backgroundColor: Color = .brandPrimary
-    var foregroundColor: Color = .white
-    var cornerRadius: CGFloat = 12
-    var isDisabled: Bool = false
-    
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.headline)
-            .padding()
-            .frame(maxWidth: .infinity)
-            .background(
-                RoundedRectangle(cornerRadius: cornerRadius)
-                    .fill(backgroundColor.opacity(isDisabled ? 0.5 : (configuration.isPressed ? 0.85 : 1.0)))
-            )
-            .foregroundColor(foregroundColor.opacity(isDisabled ? 0.6 : 1.0))
-            .scaleEffect(configuration.isPressed && !isDisabled ? 0.97 : 1.0)
-            .animation(.spring(response: 0.3, dampingFraction: 0.6, blendDuration: 0), value: configuration.isPressed)
-    }
-}
-
-struct SecondaryButtonStyle: ButtonStyle {
-    var borderColor: Color = .brandPrimary
-    var foregroundColor: Color = .brandPrimary
-    var cornerRadius: CGFloat = 12
-    
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.headline)
-            .padding()
-            .frame(maxWidth: .infinity)
-            .background(
-                RoundedRectangle(cornerRadius: cornerRadius)
-                    .stroke(borderColor, lineWidth: 2)
-                    .background(Color.white.opacity(configuration.isPressed ? 0.1 : 0.0))
-            )
-            .foregroundColor(foregroundColor)
-            .cornerRadius(cornerRadius)
-            .scaleEffect(configuration.isPressed ? 0.97 : 1.0)
-            .animation(.spring(response: 0.3, dampingFraction: 0.6, blendDuration: 0), value: configuration.isPressed)
-    }
-}
-
-// MARK: - Pill Badges
 struct StatusBadge: View {
     let text: String
-    let iconName: String?
+    var iconName: String? = nil
     let color: Color
-    
+
     var body: some View {
-        HStack(spacing: 4) {
-            if let icon = iconName {
-                Image(systemName: icon)
-                    .font(.caption2)
+        HStack(spacing: 5) {
+            if let iconName {
+                Image(systemName: iconName).accessibilityHidden(true)
             }
             Text(text)
-                .font(.caption)
-                .bold()
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(color.opacity(0.15))
-        .foregroundColor(color)
-        .clipShape(Capsule())
-        .overlay(
-            Capsule()
-                .stroke(color.opacity(0.3), lineWidth: 1)
-        )
+        .font(.caption.weight(.semibold))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .foregroundStyle(color)
+        .background(color.opacity(0.12), in: Capsule())
+        .accessibilityElement(children: .combine)
     }
 }
 
-// MARK: - Notification Banner
-struct NotificationBanner: View {
+struct EmptyState: View {
+    let title: String
     let message: String
-    let style: BannerStyle
-    
-    enum BannerStyle {
+    let systemImage: String
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: systemImage)
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(title).font(.headline)
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 32)
+        .padding(.horizontal, 20)
+    }
+}
+
+struct InlineNotice: View {
+    let message: String
+    var style: NoticeStyle = .info
+
+    enum NoticeStyle {
         case success, error, info
-        
+
         var color: Color {
             switch self {
             case .success: return .statusSuccess
@@ -145,203 +162,111 @@ struct NotificationBanner: View {
             case .info: return .brandPrimary
             }
         }
-        
+
         var icon: String {
             switch self {
             case .success: return "checkmark.circle.fill"
-            case .error: return "exclamationmark.triangle.fill"
+            case .error: return "exclamationmark.circle.fill"
             case .info: return "info.circle.fill"
             }
         }
     }
-    
+
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(alignment: .top, spacing: 10) {
             Image(systemName: style.icon)
-                .foregroundColor(style.color)
-                .font(.title2)
+                .foregroundStyle(style.color)
+                .accessibilityHidden(true)
             Text(message)
-                .foregroundColor(.primary)
                 .font(.subheadline)
-                .multilineTextAlignment(.leading)
-            Spacer()
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding()
-        .background(Color.systemBackground)
-        .cornerRadius(12)
-        .shadow(color: Color.black.opacity(0.1), radius: 10, x: 0, y: 5)
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(style.color.opacity(0.3), lineWidth: 1)
-        )
-        .padding()
+        .padding(14)
+        .background(style.color.opacity(0.09), in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
     }
 }
 
-// MARK: - Loading Overlay
-struct LoadingOverlay: View {
-    var message: String = "Loading..."
-    
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.4)
-                .edgesIgnoringSafeArea(.all)
-            
-            VStack(spacing: 16) {
-                ProgressView()
-                    .progressViewStyle(CircularProgressViewStyle(tint: .brandPrimary))
-                    .scaleEffect(1.5)
-                
-                Text(message)
-                    .font(.headline)
-                    .foregroundColor(.white)
-            }
-            .padding(32)
-            .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.systemBackground.opacity(0.85))
-            )
-            .shadow(radius: 20)
-        }
+struct WorkspacePrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    var backgroundColor: Color = .brandButtonBackground
+    var foregroundColor: Color = .white
+    var cornerRadius: CGFloat = 12
+    var isDisabled: Bool = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.headline)
+            .frame(maxWidth: .infinity, minHeight: 24)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .foregroundStyle(foregroundColor)
+            .background(backgroundColor, in: RoundedRectangle(cornerRadius: cornerRadius))
+            .opacity(!isEnabled || isDisabled ? 0.45 : configuration.isPressed ? 0.8 : 1)
+            .contentShape(RoundedRectangle(cornerRadius: cornerRadius))
     }
 }
 
-// MARK: - Standard Gradient Background
-struct PremiumBackground: View {
-    var body: some View {
-        ZStack {
-            Color.brandBackground
-                .edgesIgnoringSafeArea(.all)
-            
-            // Subtle top-right glowing gradient sphere
-            Circle()
-                .fill(LinearGradient(colors: [.brandPrimary.opacity(0.25), .clear], startPoint: .top, endPoint: .bottom))
-                .frame(width: 400, height: 400)
-                .offset(x: 180, y: -250)
-            
-            // Subtle bottom-left glowing gradient sphere
-            Circle()
-                .fill(LinearGradient(colors: [.brandSecondary.opacity(0.2), .clear], startPoint: .bottom, endPoint: .top))
-                .frame(width: 350, height: 350)
-                .offset(x: -180, y: 350)
-        }
-    }
-}
-
-// MARK: - Clipboard Copy Utility
 struct Clipboard {
     static func copy(text: String) {
-        #if os(iOS)
+        #if canImport(UIKit)
         UIPasteboard.general.string = text
-        #elseif os(macOS)
+        #elseif canImport(AppKit)
         let pasteboard = NSPasteboard.general
-        pasteboard.declareTypes([.string], owner: nil)
+        pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
         #endif
     }
 }
 
-// MARK: - Cross-Platform View Modifiers
 enum CrossPlatformKeyboardType {
-    case emailAddress
-    case url
-    case decimal
-    case `default`
+    case emailAddress, url, decimal, `default`
 }
 
 extension View {
+    func workspaceInputStyle() -> some View {
+        self
+            .textFieldStyle(.plain)
+            .padding(12)
+            .frame(minHeight: 46)
+            .background(Color.listBackground, in: RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+            }
+    }
+
     @ViewBuilder
     func crossPlatformKeyboardType(_ type: CrossPlatformKeyboardType) -> some View {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         switch type {
-        case .emailAddress:
-            self.keyboardType(.emailAddress)
-        case .url:
-            self.keyboardType(.URL)
-        case .decimal:
-            self.keyboardType(.decimalPad)
-        default:
-            self
+        case .emailAddress: self.keyboardType(.emailAddress)
+        case .url: self.keyboardType(.URL)
+        case .decimal: self.keyboardType(.decimalPad)
+        default: self
         }
         #else
         self
         #endif
     }
-    
-    @ViewBuilder
-    func crossPlatformAutocapitalization() -> some View {
-        #if os(iOS)
-        self.autocapitalization(.none)
-        #else
-        self
-        #endif
-    }
-    
-    @ViewBuilder
-    func crossPlatformListStyle() -> some View {
-        #if os(iOS) && !targetEnvironment(macCatalyst)
-        self.listStyle(InsetGroupedListStyle())
-        #else
-        self.listStyle(InsetListStyle())
-        #endif
-    }
 
     @ViewBuilder
-    func crossPlatformNavigationViewStyle() -> some View {
-        #if os(iOS) && !targetEnvironment(macCatalyst)
-        self.navigationViewStyle(StackNavigationViewStyle())
+    func crossPlatformAutocapitalization() -> some View {
+        #if os(iOS) || os(visionOS)
+        self.textInputAutocapitalization(.never)
         #else
-        self.navigationViewStyle(.automatic)
+        self
         #endif
     }
 
     @ViewBuilder
     func crossPlatformNavigationBarTitleDisplayModeInline() -> some View {
-        #if os(iOS) && !targetEnvironment(macCatalyst)
+        #if os(iOS) || os(visionOS)
         self.navigationBarTitleDisplayMode(.inline)
         #else
         self
         #endif
     }
 
-    @ViewBuilder
-    func crossPlatformNavigationBarHidden(_ hidden: Bool) -> some View {
-        #if os(iOS) && !targetEnvironment(macCatalyst)
-        self.navigationBarHidden(hidden)
-        #else
-        self
-        #endif
-    }
-
-    @ViewBuilder
-    func crossPlatformToolbar(
-        leading: AnyView? = nil,
-        trailing: AnyView? = nil
-    ) -> some View {
-        self.toolbar {
-            #if os(iOS) && !targetEnvironment(macCatalyst)
-            if let leading = leading {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    leading
-                }
-            }
-            if let trailing = trailing {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    trailing
-                }
-            }
-            #else
-            if let leading = leading {
-                ToolbarItem(placement: .navigation) {
-                    leading
-                }
-            }
-            if let trailing = trailing {
-                ToolbarItem(placement: .primaryAction) {
-                    trailing
-                }
-            }
-            #endif
-        }
-    }
 }

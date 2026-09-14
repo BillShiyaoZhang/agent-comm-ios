@@ -1,232 +1,157 @@
 import SwiftUI
 
 struct LoginView: View {
-    @ObservedObject var networkManager = NetworkManager.shared
+    @ObservedObject private var networkManager = NetworkManager.shared
     @State private var email = ""
     @State private var password = ""
     @State private var serverUrl = ""
     @State private var isLoading = false
-    @State private var errorMessage = ""
+    @State private var errorMessage: String?
     @State private var showRegister = false
-    @State private var isConfiguringServer = false
-    
+    @FocusState private var focusedField: Field?
+
+    private enum Field { case server, email, password }
+
     var body: some View {
-        NavigationView {
-            ZStack {
-                PremiumBackground()
-                
-                ScrollView {
-                    VStack(spacing: 28) {
-                        Spacer().frame(height: 40)
-                        
-                        // Header App Icon & Title
-                        VStack(spacing: 12) {
-                            ZStack {
-                                RoundedRectangle(cornerRadius: 20)
-                                    .fill(LinearGradient(colors: [.brandPrimary, .brandSecondary], startPoint: .topLeading, endPoint: .bottomTrailing))
-                                    .frame(width: 80, height: 80)
-                                
-                                Image(systemName: "square.stack.3d.up.fill")
-                                    .font(.system(size: 40))
-                                    .foregroundColor(.white)
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Image(systemName: "square.stack.3d.up.fill")
+                            .font(.largeTitle)
+                            .foregroundStyle(Color.brandPrimary)
+                            .padding(16)
+                            .background(Color.brandPrimary.opacity(0.1), in: RoundedRectangle(cornerRadius: 20))
+                            .accessibilityHidden(true)
+                        Text("连接你的工作区")
+                            .font(.largeTitle.bold())
+                        Text("查看智能体、处理协作消息，让需要你决定的事及时向前。")
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if let errorMessage {
+                        InlineNotice(message: errorMessage, style: .error)
+                    }
+
+                    WorkspaceCard {
+                        VStack(alignment: .leading, spacing: 20) {
+                            WorkspaceField(title: "工作区地址", hint: "使用已部署的工作区地址。连接电脑上的服务时，请填写电脑的局域网地址。") {
+                                TextField("https://workspace.example.com", text: $serverUrl)
+                                    .crossPlatformKeyboardType(.url)
+                                    .crossPlatformAutocapitalization()
+                                    .autocorrectionDisabled()
+                                    .workspaceInputStyle()
+                                    .focused($focusedField, equals: .server)
+                                    .submitLabel(.next)
+                                    .onSubmit { focusedField = .email }
                             }
-                            .shadow(color: .brandPrimary.opacity(0.4), radius: 10, x: 0, y: 5)
-                            
-                            Text("Agent Collab")
-                                .font(.system(size: 32, weight: .bold, design: .rounded))
-                                .foregroundColor(.white)
-                            
-                            Text("AI Agent Collaboration & HITL Platform")
-                                .font(.subheadline)
-                                .foregroundColor(.white.opacity(0.6))
-                        }
-                        
-                        // Error Alert Banner
-                        if !errorMessage.isEmpty {
-                            HStack {
-                                Image(systemName: "exclamationmark.circle.fill")
-                                    .foregroundColor(.statusDestructive)
-                                Text(errorMessage)
-                                    .font(.subheadline)
-                                    .foregroundColor(.white)
-                                Spacer()
-                            }
-                            .padding()
-                            .background(Color.statusDestructive.opacity(0.15))
-                            .cornerRadius(12)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.statusDestructive.opacity(0.3), lineWidth: 1)
-                            )
-                            .padding(.horizontal)
-                        }
-                        
-                        // Form Card
-                        VStack(spacing: 20) {
-                            // Server URL Toggle Section
-                            VStack(alignment: .leading, spacing: 8) {
-                                Button(action: {
-                                    withAnimation {
-                                        isConfiguringServer.toggle()
-                                    }
-                                }) {
-                                    HStack {
-                                        Image(systemName: "server.rack")
-                                            .foregroundColor(.brandSecondary)
-                                        Text(isConfiguringServer ? "Hide Server Configuration" : "Configure Server URL")
-                                            .font(.footnote)
-                                            .bold()
-                                            .foregroundColor(.brandSecondary)
-                                        Spacer()
-                                        Image(systemName: isConfiguringServer ? "chevron.up" : "chevron.down")
-                                            .font(.footnote)
-                                            .foregroundColor(.brandSecondary)
-                                    }
-                                }
-                                
-                                if isConfiguringServer {
-                                    VStack(alignment: .leading, spacing: 6) {
-                                        Text("SERVER API BASE URL")
-                                            .font(.system(size: 10, weight: .bold))
-                                            .foregroundColor(.white.opacity(0.5))
-                                        
-                                        TextField("http://localhost:3000", text: $serverUrl)
-                                            .crossPlatformKeyboardType(.url)
-                                            .crossPlatformAutocapitalization()
-                                            .disableAutocorrection(true)
-                                            .foregroundColor(.white)
-                                            .padding()
-                                            .background(Color.white.opacity(0.08))
-                                            .cornerRadius(10)
-                                            .overlay(
-                                                RoundedRectangle(cornerRadius: 10)
-                                                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                            )
-                                    }
-                                    .transition(.opacity.combined(with: .move(edge: .top)))
-                                    .padding(.top, 4)
-                                }
-                            }
-                            .padding(.bottom, 4)
-                            
-                            // Email Input
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("EMAIL ADDRESS")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundColor(.white.opacity(0.5))
-                                
+
+                            Divider()
+
+                            WorkspaceField(title: "邮箱") {
                                 TextField("you@example.com", text: $email)
+                                    .textContentType(.username)
                                     .crossPlatformKeyboardType(.emailAddress)
                                     .crossPlatformAutocapitalization()
-                                    .disableAutocorrection(true)
-                                    .foregroundColor(.white)
-                                    .padding()
-                                    .background(Color.white.opacity(0.08))
-                                    .cornerRadius(10)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                    )
+                                    .autocorrectionDisabled()
+                                    .workspaceInputStyle()
+                                    .focused($focusedField, equals: .email)
+                                    .submitLabel(.next)
+                                    .onSubmit { focusedField = .password }
                             }
-                            
-                            // Password Input
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("PASSWORD")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundColor(.white.opacity(0.5))
-                                
-                                SecureField("••••••••", text: $password)
-                                    .foregroundColor(.white)
-                                    .padding()
-                                    .background(Color.white.opacity(0.08))
-                                    .cornerRadius(10)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                    )
+                            WorkspaceField(title: "密码") {
+                                SecureField("输入账户密码", text: $password)
+                                    .textContentType(.password)
+                                    .workspaceInputStyle()
+                                    .focused($focusedField, equals: .password)
+                                    .submitLabel(.go)
+                                    .onSubmit(handleLogin)
                             }
-                            
-                            // Login Button
                             Button(action: handleLogin) {
-                                HStack {
-                                    if isLoading {
-                                        ProgressView()
-                                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                                            .padding(.trailing, 8)
-                                    }
-                                    Text(isLoading ? "Signing In..." : "Sign In")
-                                        .bold()
+                                HStack(spacing: 8) {
+                                    if isLoading { ProgressView().tint(.white) }
+                                    Text(isLoading ? "正在登录…" : "登录工作区")
                                 }
                             }
-                            .buttonStyle(PremiumButtonStyle(backgroundColor: .brandPrimary, isDisabled: isLoading))
+                            .buttonStyle(WorkspacePrimaryButtonStyle())
                             .disabled(isLoading)
-                            
                         }
-                        .padding(24)
-                        .glassCardStyle()
-                        .padding(.horizontal)
-                        
-                        // Register Link
-                        NavigationLink(destination: RegisterView(), isActive: $showRegister) {
-                            Button(action: { showRegister = true }) {
-                                HStack {
-                                    Text("Don't have an account?")
-                                        .foregroundColor(.white.opacity(0.6))
-                                    Text("Sign Up")
-                                        .bold()
-                                        .foregroundColor(.brandSecondary)
-                                }
-                                .font(.subheadline)
-                            }
-                        }
-                        .padding(.top, 8)
-                        
-                        Spacer()
+                        .disabled(isLoading)
                     }
+
+                    Button(action: openRegistration) {
+                        Text("还没有账户？创建账户")
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.brandPrimary)
+                    .disabled(isLoading)
+
+                    Label("账户属于当前工作区，切换地址后需要重新登录。", systemImage: "lock.shield")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                .frame(maxWidth: 520)
+                .padding(24)
+                .frame(maxWidth: .infinity)
             }
-            .crossPlatformNavigationBarHidden(true)
+            .background(Color.listBackground)
+            .navigationTitle("Agent Workspace")
+            .crossPlatformNavigationBarTitleDisplayModeInline()
+            .navigationDestination(isPresented: $showRegister) {
+                RegisterView(serverURL: serverUrl)
+            }
         }
-        .crossPlatformNavigationViewStyle()
+        .tint(.brandPrimary)
         .onAppear {
-            self.serverUrl = networkManager.baseUrl
-            self.errorMessage = ""
+            if serverUrl.isEmpty { serverUrl = networkManager.baseUrl }
         }
     }
-    
+
+    private func openRegistration() {
+        do {
+            try networkManager.configureServer(serverUrl)
+            serverUrl = networkManager.baseUrl
+            errorMessage = nil
+            showRegister = true
+        } catch {
+            errorMessage = error.localizedDescription
+            focusedField = .server
+        }
+    }
+
     private func handleLogin() {
-        guard !email.isEmpty, !password.isEmpty else {
-            errorMessage = "Please fill in all fields"
+        guard !isLoading else { return }
+        let normalizedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedEmail.isEmpty, !password.isEmpty else {
+            errorMessage = "请填写邮箱和密码。"
+            focusedField = normalizedEmail.isEmpty ? .email : .password
             return
         }
-        
-        errorMessage = ""
-        isLoading = true
-        
-        // Update URL first
-        if !serverUrl.isEmpty {
-            networkManager.baseUrl = serverUrl
+        do {
+            try networkManager.configureServer(serverUrl)
+            serverUrl = networkManager.baseUrl
+        } catch {
+            errorMessage = error.localizedDescription
+            focusedField = .server
+            return
         }
-        
+        focusedField = nil
+        errorMessage = nil
+        isLoading = true
         Task {
+            defer { isLoading = false }
             do {
-                try await networkManager.login(email: email, password: password)
-                DispatchQueue.main.async {
-                    self.isLoading = false
-                }
+                try await networkManager.login(email: normalizedEmail, password: password)
+                password = ""
             } catch {
-                DispatchQueue.main.async {
-                    self.isLoading = false
-                    self.errorMessage = error.localizedDescription
-                }
+                errorMessage = error.localizedDescription
             }
         }
     }
 }
 
-struct LoginView_Previews: PreviewProvider {
-    static var previews: some View {
-        LoginView()
-            .preferredColorScheme(.dark)
-    }
-}
+#Preview { LoginView() }

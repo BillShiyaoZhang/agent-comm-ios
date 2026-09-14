@@ -1,284 +1,99 @@
 import SwiftUI
 
 struct DashboardView: View {
-    @ObservedObject var networkManager = NetworkManager.shared
-    @State private var agentCount = 0
-    @State private var contactCount = 0
-    @State private var pendingHitlCount = 0
-    @State private var transactionCount = 0
-    @State private var isLoading = false
+    @EnvironmentObject private var store: WorkspaceStore
     @State private var showSettings = false
-    @State private var showServiceInvocation = false
-    @State private var recentRequests: [HITLRequest] = []
-    
+    @State private var showConnect = false
     var body: some View {
-        NavigationView {
-            ZStack {
-                Color.systemGroupedBackground
-                    .edgesIgnoringSafeArea(.all)
-                
-                ScrollView {
-                    VStack(spacing: 20) {
-                        // Quick Action Buttons
-                        HStack(spacing: 12) {
-                            Button(action: { showServiceInvocation = true }) {
-                                HStack {
-                                    Image(systemName: "bolt.fill")
-                                    Text("Invoke Service")
-                                        .bold()
-                                }
-                                .padding()
-                                .frame(maxWidth: .infinity)
-                                .background(LinearGradient(colors: [.brandPrimary, .brandPrimary.opacity(0.8)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                                .foregroundColor(.white)
-                                .cornerRadius(12)
-                                .shadow(color: .brandPrimary.opacity(0.3), radius: 5, x: 0, y: 3)
-                            }
-                            
-                            // Navigation link to Services page
-                            NavigationLink(destination: ServicesView(), isActive: $showServiceInvocation) {
-                                EmptyView()
-                            }
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("让协作，继续向前。").font(.title2.weight(.semibold))
+                        Text("连接你的 Agent，在这里接续对话、掌握进展。").font(.subheadline).foregroundStyle(.secondary)
+                    }.padding(.top, 6)
+                    WorkspaceFeedback()
+                    if store.isLoading { ProgressView("正在读取你的工作空间…").frame(maxWidth: .infinity).padding(40) }
+                    else if store.connections.isEmpty { onboarding }
+                    else {
+                        connectionSection
+                        if store.workspace != nil { currentWorkspace }
+                    }
+                }.padding(20).frame(maxWidth: 920).frame(maxWidth: .infinity)
+            }.background(Color.listBackground)
+                .refreshable { await store.refresh(schedule: true) }
+                .navigationTitle("工作台")
+                .toolbar {
+                    ToolbarItem { Button { showConnect = true } label: { Label("添加连接", systemImage: "plus") }.disabled(store.demo) }
+                    ToolbarItem { Button { showSettings = true } label: { Label("设置", systemImage: "gearshape") } }
+                }
+                .sheet(isPresented: $showConnect) { AddConnectionView() }
+                .sheet(isPresented: $showSettings) { SettingsView() }
+        }
+    }
+    private var onboarding: some View {
+        WorkspaceCard {
+            VStack(alignment: .leading, spacing: 24) {
+                Image(systemName: "point.3.connected.trianglepath.dotted").font(.system(size: 40)).foregroundStyle(Color.brandPrimary)
+                Text("从连接第一个 Agent 开始").font(.title3.weight(.semibold))
+                step("1", "保存连接", "填写名称和 Agent 的完整 URN。")
+                step("2", "在本机授权", "用你的控制台身份完成一次配对。")
+                step("3", "接续工作", "对话、联系人和协作进展会自动同步。")
+                Button { showConnect = true } label: { Label("连接 Agent", systemImage: "plus").frame(maxWidth: .infinity) }.buttonStyle(.borderedProminent).controlSize(.large)
+            }
+        }
+    }
+    private func step(_ index: String, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Text(index).font(.subheadline.bold()).frame(width: 28, height: 28).background(Color.brandPrimary.opacity(0.1), in: Circle()).foregroundStyle(Color.brandPrimary)
+            VStack(alignment: .leading, spacing: 4) { Text(title).font(.subheadline.bold()); Text(detail).font(.subheadline).foregroundStyle(.secondary) }
+        }
+    }
+    private var connectionSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack { Text("我的 Agent").font(.headline); Spacer(); Text("\(store.connections.count) 个连接").font(.caption).foregroundStyle(.secondary) }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 280), alignment: .leading)], spacing: 12) {
+                ForEach(store.connections) { agent in
+                    Button { Task { await store.selectAgent(agent.id) } } label: {
+                        WorkspaceCard {
+                            HStack(spacing: 12) {
+                                AgentAvatar(name: agent.name)
+                                VStack(alignment: .leading, spacing: 7) { Text(agent.name).font(.headline).foregroundStyle(.primary); SyncStatusView(sync: agent.sync) }
+                                Spacer(minLength: 4)
+                                if agent.id == store.selectedAgentID { Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.brandPrimary) }
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }.overlay(RoundedRectangle(cornerRadius: 20).stroke(agent.id == store.selectedAgentID ? Color.brandPrimary.opacity(0.45) : .clear, lineWidth: 1.5))
+                    }.buttonStyle(.plain).disabled(store.busy != nil)
+                }
+            }
+        }
+    }
+    @ViewBuilder private var currentWorkspace: some View {
+        if let workspace = store.workspace {
+            PairingView()
+            if !workspace.snapshots.isEmpty {
+                WorkspaceCard {
+                    VStack(alignment: .leading, spacing: 18) {
+                        HStack { Text("现在的进展").font(.headline); Spacer(); if let last = workspace.sync.lastSuccessAt { Text(Date(timeIntervalSince1970: last / 1000), style: .relative).font(.caption).foregroundStyle(.secondary) } }
+                        HStack(alignment: .top, spacing: 12) {
+                            metric("已保存对话", value: workspace.conversations.count, icon: "bubble.left.and.bubble.right")
+                            metric("联系人", value: store.contacts.count, icon: "person.2")
+                            metric("待确认", value: store.pendingCount, icon: "hand.raised")
                         }
-                        .padding(.horizontal)
-                        .padding(.top, 12)
-                        
-                        // Stat Cards Grid
-                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 16) {
-                            StatCard(
-                                title: "Active Agents",
-                                value: "\(agentCount)",
-                                iconName: "cpu",
-                                gradientColors: [.brandPrimary, .brandPrimary.opacity(0.6)]
-                            )
-                            
-                            StatCard(
-                                title: "Contacts",
-                                value: "\(contactCount)",
-                                iconName: "person.2.fill",
-                                gradientColors: [.brandSecondary, .brandSecondary.opacity(0.6)]
-                            )
-                            
-                            StatCard(
-                                title: "Pending HITL",
-                                value: "\(pendingHitlCount)",
-                                iconName: "shield.fill",
-                                gradientColors: [.statusWarning, .statusWarning.opacity(0.7)]
-                            )
-                            
-                            StatCard(
-                                title: "Transactions",
-                                value: "\(transactionCount)",
-                                iconName: "creditcard.fill",
-                                gradientColors: [.statusSuccess, .statusSuccess.opacity(0.7)]
-                            )
-                        }
-                        .padding(.horizontal)
-                        
-                        // Recent HITL Approvals Header
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack {
-                                Text("Recent Requests")
-                                    .font(.title2)
-                                    .bold()
-                                Spacer()
-                                if isLoading {
-                                    ProgressView()
-                                        .progressViewStyle(CircularProgressViewStyle(tint: .brandPrimary))
-                                }
-                            }
-                            .padding(.horizontal)
-                            
-                            if recentRequests.isEmpty {
-                                VStack(spacing: 12) {
-                                    Image(systemName: "tray.fill")
-                                        .font(.largeTitle)
-                                        .foregroundColor(.secondary)
-                                    Text("No pending requests")
-                                        .foregroundColor(.secondary)
-                                        .font(.subheadline)
-                                }
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 40)
-                                .background(Color.secondarySystemGroupedBackground)
-                                .cornerRadius(16)
-                                .padding(.horizontal)
-                            } else {
-                                VStack(spacing: 12) {
-                                    ForEach(recentRequests.prefix(4)) { request in
-                                        RecentRequestRow(request: request)
-                                    }
-                                }
-                                .padding(.horizontal)
-                            }
-                        }
+                        Divider()
+                        if store.pendingCount > 0 {
+                            Label("\(store.pendingCount) 项协作请求等待你在 Agent 原生渠道确认。", systemImage: "hand.raised.fill").font(.subheadline).foregroundStyle(Color.statusWarning)
+                        } else { Text("接续上次的想法，或交给 Agent 一件新任务。").font(.subheadline).foregroundStyle(.secondary) }
+                        HStack {
+                            Button { store.tab = 1 } label: { Label("继续对话", systemImage: "arrow.up.right.message").frame(maxWidth: .infinity) }.buttonStyle(.borderedProminent)
+                            Button { store.tab = 2 } label: { Text("查看协作").frame(maxWidth: .infinity) }.buttonStyle(.bordered)
+                        }.controlSize(.large)
                     }
                 }
-                .refreshable {
-                    await loadDashboardData()
-                }
-            }
-            .navigationTitle("Dashboard")
-            .crossPlatformToolbar(trailing: AnyView(Button(action: {
-                showSettings = true
-            }) {
-                Image(systemName: "gearshape.fill")
-                    .font(.title3)
-                    .foregroundColor(.brandPrimary)
-            }))
-            // Settings navigation sheet
-            .sheet(isPresented: $showSettings, onDismiss: {
-                Task {
-                    await loadDashboardData()
-                }
-            }) {
-                SettingsView()
-            }
-        }
-        .crossPlatformNavigationViewStyle()
-        .onAppear {
-            Task {
-                await loadDashboardData()
             }
         }
     }
-    
-    // Concurrently load statistics
-    private func loadDashboardData() async {
-        DispatchQueue.main.async {
-            self.isLoading = true
-        }
-        
-        do {
-            async let agents = networkManager.fetchAgents()
-            async let contacts = networkManager.fetchContacts()
-            async let requests = networkManager.fetchHITLRequests()
-            async let transactions = networkManager.fetchTransactions()
-            
-            let (loadedAgents, loadedContacts, loadedRequests, loadedTxs) = try await (agents, contacts, requests, transactions)
-            
-            DispatchQueue.main.async {
-                self.agentCount = loadedAgents.count
-                self.contactCount = loadedContacts.count
-                self.pendingHitlCount = loadedRequests.filter { $0.status == "pending" }.count
-                self.transactionCount = loadedTxs.count
-                self.recentRequests = loadedRequests
-                self.isLoading = false
-            }
-        } catch {
-            print("Failed to load dashboard metrics: \(error)")
-            DispatchQueue.main.async {
-                self.isLoading = false
-            }
-        }
-    }
-}
-
-// MARK: - Stat Card Component
-struct StatCard: View {
-    let title: String
-    let value: String
-    let iconName: String
-    let gradientColors: [Color]
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(LinearGradient(colors: gradientColors, startPoint: .topLeading, endPoint: .bottomTrailing))
-                        .frame(width: 36, height: 36)
-                    
-                    Image(systemName: iconName)
-                        .foregroundColor(.white)
-                        .font(.body)
-                }
-                Spacer()
-            }
-            
-            VStack(alignment: .leading, spacing: 4) {
-                Text(value)
-                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                    .foregroundColor(.primary)
-                
-                Text(title)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .bold()
-            }
-        }
-        .padding()
-        .background(Color.secondarySystemGroupedBackground)
-        .cornerRadius(16)
-        .shadow(color: Color.black.opacity(0.04), radius: 5, x: 0, y: 2)
-    }
-}
-
-// MARK: - Recent Request Row Component
-struct RecentRequestRow: View {
-    let request: HITLRequest
-    
-    var body: some View {
-        HStack(spacing: 16) {
-            // Icon according to type
-            ZStack {
-                Circle()
-                    .fill(getBackgroundForType().opacity(0.15))
-                    .frame(width: 44, height: 44)
-                
-                Image(systemName: getIconForType())
-                    .foregroundColor(getBackgroundForType())
-                    .font(.subheadline)
-            }
-            
-            VStack(alignment: .leading, spacing: 4) {
-                Text(request.agent?.name ?? "Agent Action")
-                    .font(.headline)
-                
-                Text(request.requestType.uppercased())
-                    .font(.caption2)
-                    .bold()
-                    .foregroundColor(.secondary)
-            }
-            
-            Spacer()
-            
-            // Status Badge
-            if request.status == "pending" {
-                StatusBadge(text: "Pending", iconName: "clock.fill", color: .statusWarning)
-            } else if request.status == "approved" {
-                StatusBadge(text: "Approved", iconName: "checkmark", color: .statusSuccess)
-            } else {
-                StatusBadge(text: "Rejected", iconName: "xmark", color: .statusDestructive)
-            }
-        }
-        .padding()
-        .background(Color.secondarySystemGroupedBackground)
-        .cornerRadius(16)
-        .shadow(color: Color.black.opacity(0.02), radius: 3, x: 0, y: 1)
-    }
-    
-    private func getIconForType() -> String {
-        switch request.requestType {
-        case "message": return "bubble.left.fill"
-        case "service_call": return "bolt.fill"
-        case "transaction": return "creditcard.fill"
-        default: return "questionmark.circle.fill"
-        }
-    }
-    
-    private func getBackgroundForType() -> Color {
-        switch request.requestType {
-        case "message": return .brandPrimary
-        case "service_call": return .brandSecondary
-        case "transaction": return .statusSuccess
-        default: return .secondary
-        }
-    }
-}
-
-struct DashboardView_Previews: PreviewProvider {
-    static var previews: some View {
-        DashboardView()
+    private func metric(_ title: String, value: Int, icon: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) { Image(systemName: icon).foregroundStyle(Color.brandPrimary); Text("\(value)").font(.title.bold()).monospacedDigit(); Text(title).font(.caption).foregroundStyle(.secondary) }.frame(maxWidth: .infinity, alignment: .leading)
     }
 }
