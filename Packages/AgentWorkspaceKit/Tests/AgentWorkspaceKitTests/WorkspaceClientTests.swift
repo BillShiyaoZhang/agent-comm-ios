@@ -260,6 +260,13 @@ final class WorkspaceClientTests: XCTestCase {
         XCTAssertTrue(pairingAllowsSend(capabilities: ["pairing": ["expires_at": "2026-09-15T08:00:00.000Z"]], sync: .init(status: "ready"), now: now))
     }
 
+    func testOperatorRemovalReplacesCachedTurnsAndCannotBeUndoneByStalePages() {
+        let cached: RemoteRecord = ["turn_id": "reported-turn", "status": "completed", "created_at": 2, "response": "Removed content"]
+        let removed: RemoteRecord = ["turn_id": "reported-turn", "status": "running", "created_at": 2, "response": "此回复已根据举报处理决定移除。", "content_review": ["status": "rejected"]]
+        XCTAssertEqual(mergeTurns(earlier: [cached], latest: [removed]), [removed])
+        XCTAssertEqual(mergeTurns(earlier: [removed], latest: [cached]), [removed])
+    }
+
     func testCanonicalPairingPolicyVectors() throws {
         let cases = try JSONDecoder().decode(RemoteRecord.self, from: fixture("policy-cases"))
         for vector in cases.records("pairing") {
@@ -269,7 +276,7 @@ final class WorkspaceClientTests: XCTestCase {
     }
 
     func testCurrentRPCMethodsAndPolicyPausedPairingRules() throws {
-        XCTAssertEqual(RPCMethod.allCases.count, 14)
+        XCTAssertEqual(RPCMethod.allCases.count, 18)
         for method in RPCMethod.allCases {
             let call = PendingCall(requestId: requestId, method: method, params: ["text": "当前合同"])
             XCTAssertEqual(try JSONDecoder().decode(PendingCall.self, from: call.encodeRequestBody()), call)
@@ -355,6 +362,21 @@ final class WorkspaceClientTests: XCTestCase {
         catch let error as ControlCallError { XCTAssertFalse(error.uncertain); XCTAssertTrue(error.retryable) }
     }
 
+    func testPeerSafetyAdmissionErrorsDistinguishNewAndPreviouslyAcceptedTurns() async throws {
+        for (code, uncertain) in [("peer_content_safety_required", false), ("peer_content_safety_changed", true)] {
+            var body = try JSONDecoder().decode(RemoteRecord.self, from: fixture("control-pairing-error"))
+            var response = body.record("response")
+            response["method"] = "conversation.send"
+            response["error"] = ["code": .string(code), "message": "Host admission changed"]
+            body["response"] = .object(response)
+            let encoded = try JSONEncoder().encode(body)
+            StubProtocol.respond { _ in (200, [:], encoded) }
+            let call = PendingCall(requestId: requestId, method: .conversationSend, params: ["text": "Owner content"])
+            do { _ = try await client().execute(agentId: "agent-a", call: call); XCTFail("Admission error was accepted") }
+            catch let error as ControlCallError { XCTAssertEqual(error.uncertain, uncertain); XCTAssertEqual(error.call, call) }
+        }
+    }
+
     func testEmailVerificationErrorsSurviveBothNextAuthCallbackFormats() async throws {
         for status in [200, 401] {
             StubProtocol.respond { request in
@@ -436,6 +458,162 @@ final class WorkspaceClientTests: XCTestCase {
         XCTAssertEqual(requests[9].httpMethod, "DELETE")
         do { _ = try await api.previewOnboarding(code: "bad/code"); XCTFail("Invalid code accepted") } catch { }
         XCTAssertEqual(StubProtocol.requests.count, 10)
+    }
+
+    func testAccountDeletionUsesExactOriginBodyAndExplicitSuccess() async throws {
+        StubProtocol.respond { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/api/auth/delete-account")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Origin"), "https://workspace.example")
+            let body = try JSONDecoder().decode(RemoteRecord.self, from: XCTUnwrap(request.httpBody))
+            XCTAssertEqual(body, ["currentPassword": "a+&中", "confirmation": "DELETE", "expectedAccountId": "account-a"])
+            return (200, [:], Data("{\"deleted\":true,\"consoleUrn\":\"urn:test\"}".utf8))
+        }
+        try await client().deleteAccount(currentPassword: "a+&中", expectedAccountID: "account-a")
+        XCTAssertEqual(StubProtocol.requests.count, 1)
+    }
+
+    func testAccountDeletionRejectsMalformedOrNonFinalSuccessWithoutRetry() async throws {
+        for (status, body) in [(200, "{}"), (200, "{\"deleted\":false}"), (200, "{\"deleted\":\"true\"}"), (202, "{\"deleted\":true}")] {
+            StubProtocol.respond { _ in (status, [:], Data(body.utf8)) }
+            do { try await client().deleteAccount(currentPassword: "current", expectedAccountID: "account-a"); XCTFail("Unconfirmed deletion accepted") }
+            catch let error as AccountDeletionError { XCTAssertTrue(error.uncertain) }
+            XCTAssertEqual(StubProtocol.requests.count, 1)
+        }
+    }
+
+    func testAccountDeletionDistinguishesRejectionFromLostResponse() async throws {
+        for status in [400, 401, 403, 404, 409, 413, 429, 500, 503] {
+            StubProtocol.respond { _ in (status, [:], Data("{\"error\":\"删除未完成\"}".utf8)) }
+            do { try await client().deleteAccount(currentPassword: "current", expectedAccountID: "account-a"); XCTFail("Failure accepted") }
+            catch let error as AccountDeletionError {
+                XCTAssertEqual(error.httpStatus, status)
+                XCTAssertEqual(error.uncertain, status >= 500)
+            }
+            XCTAssertEqual(StubProtocol.requests.count, 1)
+        }
+        StubProtocol.respond { _ in throw URLError(.networkConnectionLost) }
+        do { try await client().deleteAccount(currentPassword: "current", expectedAccountID: "account-a"); XCTFail("Lost reply accepted") }
+        catch let error as AccountDeletionError { XCTAssertTrue(error.uncertain); XCTAssertNil(error.httpStatus) }
+        XCTAssertEqual(StubProtocol.requests.count, 1)
+    }
+
+    func testAccountDeletionInvalidInputNeverSendsRequest() async throws {
+        StubProtocol.respond { _ in XCTFail("Invalid input sent"); return (200, [:], Data("{\"deleted\":true}".utf8)) }
+        let api = try client()
+        for password in ["", String(repeating: "中", count: 342)] {
+            do { try await api.deleteAccount(currentPassword: password, expectedAccountID: "account-a"); XCTFail("Invalid password accepted") }
+            catch let error as AccountDeletionError { XCTAssertFalse(error.uncertain) }
+        }
+        XCTAssertTrue(StubProtocol.requests.isEmpty)
+    }
+
+    func testReportUsesExactPreviewAndConsentWithoutAutomaticallyAttachingChat() async throws {
+        let report: RemoteRecord = ["id": .string(requestId), "agentId": "agent-a", "status": "pending", "reason": "harassment", "target": ["kind": "inbox", "id": "m1"]]
+        StubProtocol.respond { request in
+            let body = try JSONDecoder().decode(RemoteRecord.self, from: request.httpBody ?? Data())
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Origin"), "https://workspace.example")
+            XCTAssertEqual(body.string("reportId"), self.requestId)
+            XCTAssertEqual(body.string("agentId"), "agent-a")
+            XCTAssertEqual(body.record("target"), ["kind": "inbox", "id": "m1"])
+            if request.url?.path == "/api/moderation/reports/preview" {
+                XCTAssertEqual(Set(body.keys), Set(["reportId", "agentId", "target"]))
+                return (200, [:], try JSONEncoder().encode(["reportId": .string(self.requestId), "previewToken": "bounded-token", "evidence": "allowed snippet"] as RemoteRecord))
+            }
+            XCTAssertEqual(request.url?.path, "/api/moderation/reports")
+            XCTAssertEqual(Set(body.keys), Set(["reportId", "agentId", "target", "reason", "comment", "evidence", "previewToken", "consent"]))
+            XCTAssertEqual(body["consent"], true)
+            XCTAssertEqual(body.string("evidence"), "")
+            XCTAssertEqual(body.string("previewToken"), "bounded-token")
+            return (200, [:], try JSONEncoder().encode(["report": JSONValue.object(report)]))
+        }
+        let api = try client()
+        let preview = try await api.previewContentReport(reportID: requestId, agentID: "agent-a", kind: "inbox", recordID: "m1")
+        let result = try await api.submitContentReport(reportID: requestId, agentID: "agent-a", kind: "inbox", recordID: "m1", reason: "harassment", comment: "Please review", evidence: "", previewToken: preview.string("previewToken"))
+        XCTAssertEqual(result, report)
+        XCTAssertEqual(StubProtocol.requests.count, 2)
+    }
+
+    func testReportNeverAcceptsUnfinalizedOrMismatchedReceiptsAndNeverAutoRetries() async throws {
+        let valid: RemoteRecord = ["id": .string(requestId), "agentId": "agent-a", "status": "pending", "reason": "harassment", "target": ["kind": "inbox", "id": "m1"]]
+        var foreign = valid; foreign["target"] = ["kind": "inbox", "id": "someone-else"]
+        var otherAgent = valid; otherAgent["agentId"] = "agent-b"
+        for (status, body) in [(202, ["report": JSONValue.object(valid)]), (200, ["report": JSONValue.object(otherAgent)]), (200, ["report": JSONValue.object(foreign)]), (200, ["report": JSONValue.object([:])]), (500, ["error": "failure"])] {
+            StubProtocol.respond { _ in (status, [:], try JSONEncoder().encode(body)) }
+            do {
+                _ = try await client().submitContentReport(reportID: requestId, agentID: "agent-a", kind: "inbox", recordID: "m1", reason: "harassment", comment: "", evidence: "", previewToken: "preview")
+                XCTFail("Ambiguous report receipt was accepted")
+            } catch let failure as ContentReportError { XCTAssertTrue(failure.uncertain) }
+            XCTAssertEqual(StubProtocol.requests.count, 1)
+        }
+        StubProtocol.respond { _ in throw URLError(.networkConnectionLost) }
+        do {
+            _ = try await client().submitContentReport(reportID: requestId, agentID: "agent-a", kind: "inbox", recordID: "m1", reason: "harassment", comment: "", evidence: "", previewToken: "preview")
+            XCTFail("Lost report reply was accepted")
+        } catch let failure as ContentReportError { XCTAssertTrue(failure.uncertain) }
+        XCTAssertEqual(StubProtocol.requests.count, 1)
+    }
+
+    func testReportRejectionAndInvalidInputAreKnownWithoutUnnecessaryRequests() async throws {
+        StubProtocol.respond { _ in (403, [:], Data("{\"error\":\"not authorized\"}".utf8)) }
+        do {
+            _ = try await client().submitContentReport(reportID: requestId, agentID: "agent-a", kind: "inbox", recordID: "m1", reason: "harassment", comment: "", evidence: "", previewToken: "preview")
+            XCTFail("Forbidden report was accepted")
+        } catch let failure as ContentReportError { XCTAssertFalse(failure.uncertain); XCTAssertEqual(failure.httpStatus, 403) }
+        XCTAssertEqual(StubProtocol.requests.count, 1)
+        StubProtocol.respond { _ in XCTFail("Invalid report caused HTTP request"); return (200, [:], Data()) }
+        do {
+            _ = try await client().submitContentReport(reportID: requestId, agentID: "agent-a", kind: "inbox", recordID: "m1", reason: "harassment", comment: String(repeating: "中", count: 667), evidence: "", previewToken: "preview")
+            XCTFail("Oversized explanation was accepted")
+        } catch let failure as ContentReportError { XCTAssertFalse(failure.uncertain) }
+        XCTAssertTrue(StubProtocol.requests.isEmpty)
+    }
+
+    func testReportLookupCannotSettleAnotherIDAndRejectsDuplicateListRecords() async throws {
+        let foreign: RemoteRecord = ["id": "00000000-0000-4000-8000-000000000099", "agentId": "agent-a", "status": "pending", "reason": "harassment", "target": ["kind": "inbox", "id": "m1"]]
+        StubProtocol.respond { _ in (200, [:], try JSONEncoder().encode(["report": JSONValue.object(foreign)])) }
+        do { _ = try await client().fetchContentReport(reportID: requestId); XCTFail("Different ID settled original") }
+        catch { guard case WorkspaceClientError.invalidResponse = error else { return XCTFail("Unexpected error: \(error)") } }
+        StubProtocol.respond { _ in (200, [:], try JSONEncoder().encode(["reports": [JSONValue.object(foreign), JSONValue.object(foreign)]])) }
+        do { _ = try await client().fetchContentReports(); XCTFail("Duplicate report records accepted") }
+        catch { guard case WorkspaceClientError.invalidResponse = error else { return XCTFail("Unexpected error: \(error)") } }
+    }
+
+    func testSafetyMethodsNeedExplicitCapabilitiesAndDoNotRequireAISharing() {
+        for method in [RPCMethod.contactsBlock, .contactsUnblock, .inboxReview] {
+            XCTAssertTrue(method.isWrite)
+            XCTAssertFalse(method.requiresContentSharing)
+            XCTAssertTrue(PendingCall(method: method).requiresOperationRecord)
+        }
+        XCTAssertFalse(RPCMethod.inboxReviewPreview.isWrite)
+        XCTAssertTrue(RPCMethod.messagesSend.requiresContentSharing)
+        XCTAssertFalse(availableMethods(capabilities: ["methods": [["name": "contacts.block", "available": false]]]).contains(.contactsBlock))
+        XCTAssertEqual(availableMethods(capabilities: ["methods": [["name": "contacts.block", "available": true]]]), [.contactsBlock])
+    }
+
+    func testDelayedSafetySnapshotsCannotUndoNewerACLRevisionsEvenIfClockMovesBackward() {
+        let blocked = WorkspaceSnapshot(data: ["safety_revision": 5, "blocked_peers": [["urn": "urn:agent:peer", "blocked": true]]], time: 200)
+        let stale = WorkspaceSnapshot(data: ["safety_revision": 4, "blocked_peers": []], time: 300)
+        let restored = mergeSnapshots(previous: ["contacts.list": blocked], incoming: ["contacts.list": stale])
+        XCTAssertEqual(restored["contacts.list"], blocked)
+        let unblocked = WorkspaceSnapshot(data: ["safety_revision": 6, "blocked_peers": []], time: 100)
+        XCTAssertEqual(mergeSnapshots(previous: restored, incoming: ["contacts.list": unblocked])["contacts.list"], unblocked)
+        let unsupported = WorkspaceSnapshot(data: ["blocked_peers": []], time: 400)
+        XCTAssertEqual(mergeSnapshots(previous: restored, incoming: ["contacts.list": unsupported])["contacts.list"], blocked)
+    }
+
+    func testSecureStoreNamespaceCleanupPreservesOtherNamespaces() throws {
+        let namespace = "AgentWorkspaceKit.Tests." + UUID().uuidString
+        let own = SecureStore(namespace: namespace), other = SecureStore(namespace: namespace + "-other")
+        defer { try? own.removeAll(); try? other.removeAll() }
+        try own.set(Data("draft".utf8), for: "draft.one")
+        try own.set(Data("older-version".utf8), for: "unknown-key")
+        try other.set(Data("keep".utf8), for: "draft.one")
+        try own.removeAll()
+        XCTAssertNil(try own.data(key: "draft.one"))
+        XCTAssertNil(try own.data(key: "unknown-key"))
+        XCTAssertEqual(try other.data(key: "draft.one"), Data("keep".utf8))
+        XCTAssertNoThrow(try own.removeAll())
     }
 }
 

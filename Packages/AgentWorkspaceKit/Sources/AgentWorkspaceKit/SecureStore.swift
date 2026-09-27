@@ -57,6 +57,21 @@ public final class SecureStore: @unchecked Sendable {
         #endif
     }
 
+    /// Removes only this exact service namespace, including keys from older app versions.
+    public func removeAll() throws {
+        #if canImport(Security)
+        // macOS file-based Keychain defaults to one match; explicitly include every key.
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: namespace,
+                                    kSecMatchLimit as String: kSecMatchLimitAll]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw WorkspaceClientError.secureStorage(Int(status)) }
+        #else
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        let prefix = namespace + "\u{0}"
+        Self.memory = Self.memory.filter { !$0.key.hasPrefix(prefix) }
+        #endif
+    }
+
     #if canImport(Security)
     private func baseQuery(_ key: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: namespace, kSecAttrAccount as String: key]

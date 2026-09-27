@@ -13,7 +13,15 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var currentUser: User?
     @Published private(set) var isAuthenticated = false
     @Published private(set) var isCheckingSession = false
+    @Published private(set) var isDeletingAccount = false
+    @Published private(set) var accountNotice: String?
+    @Published private(set) var localDeletionCleanupNeeded = false
     private var client: WorkspaceClient
+    private struct DeletionCleanup: Codable { let server: String; let namespace: String }
+    private var deletionCleanup: DeletionCleanup?
+    private var deletionClient: WorkspaceClient?
+    private var cleaningDeletionData = false
+    private static let cleanupKey = "agent_collab_deleted_account_cleanup"
     private var generation = 0
     var sessionRevision: Int { generation }
 
@@ -24,9 +32,18 @@ final class NetworkManager: ObservableObject {
         let normalized = (try? WorkspaceClient.validateServer(saved).absoluteString) ?? "https://agent-communication.online"
         baseUrl = normalized
         client = try! WorkspaceClient(server: normalized)
+        if let data = UserDefaults.standard.data(forKey: Self.cleanupKey),
+           let cleanup = try? JSONDecoder().decode(DeletionCleanup.self, from: data),
+           (try? WorkspaceClient.validateServer(cleanup.server).absoluteString) == cleanup.server,
+           cleanup.namespace.range(of: "^agent-workspace\\.[a-f0-9]{64}$", options: .regularExpression) != nil {
+            deletionCleanup = cleanup
+            localDeletionCleanupNeeded = true
+            accountNotice = "工作区账户已删除。此设备还有待清理的账户数据，请解锁设备后完成本机清理。"
+        }
     }
 
     func configureServer(_ server: String) throws {
+        try requireAccountIdle()
         let replacement = try WorkspaceClient(server: server)
         let normalized = replacement.baseURL.absoluteString
         guard normalized != baseUrl else { return }
@@ -44,6 +61,7 @@ final class NetworkManager: ObservableObject {
     }
 
     func checkSession() async throws {
+        if deletionCleanup != nil { try await retryLocalDeletionCleanup() }
         let epoch = generation
         isCheckingSession = true
         defer { if generation == epoch { isCheckingSession = false } }
@@ -54,6 +72,8 @@ final class NetworkManager: ObservableObject {
     }
 
     func login(email: String, password: String) async throws {
+        try requireAccountIdle()
+        if deletionCleanup != nil { try await retryLocalDeletionCleanup() }
         generation += 1
         let epoch = generation
         currentUser = nil
@@ -67,6 +87,7 @@ final class NetworkManager: ObservableObject {
         guard generation == epoch else { throw CancellationError() }
         currentUser = user
         isAuthenticated = true
+        accountNotice = nil
     }
 
     func register(email: String, password: String) async throws {
@@ -74,12 +95,83 @@ final class NetworkManager: ObservableObject {
     }
 
     func logout() async throws {
+        try requireAccountIdle()
         let previous = client
         generation += 1
         currentUser = nil
         isAuthenticated = false
         isCheckingSession = false
         try await previous.logout()
+    }
+
+    func deleteAccount(currentPassword: String, expectedServer: String, expectedUserID: String) async throws {
+        try requireAccountIdle()
+        guard isAuthenticated, let user = currentUser else { throw NetworkError.unauthorized }
+        guard baseUrl == expectedServer, user.id == expectedUserID else {
+            throw NetworkError.custom("当前账户或工作区已变化，请关闭此页后重新查看删除范围。")
+        }
+        let active = client
+        let epoch = generation
+        let server = baseUrl
+        let namespace = WorkspaceStore.recoveryNamespace(server: server, userID: user.id)
+        // Stop new work and late draft persistence while this destructive request is in flight.
+        isDeletingAccount = true
+        defer { isDeletingAccount = false }
+        do {
+            try await active.deleteAccount(currentPassword: currentPassword, expectedAccountID: user.id)
+        } catch {
+            if generation == epoch, (error as? AccountDeletionError)?.httpStatus == 401 {
+                generation += 1
+                currentUser = nil
+                isAuthenticated = false
+                accountNotice = "登录已失效，尚不能据此确认账户已删除。请重新登录核实或联系工作区运营者。"
+                try? await active.clearSession()
+            }
+            throw error
+        }
+        // A delayed response must never clear another account's session or recovery data.
+        guard generation == epoch, baseUrl == server, currentUser?.id == user.id else { return }
+        generation += 1
+        currentUser = nil
+        isAuthenticated = false
+        isCheckingSession = false
+        let cleanup = DeletionCleanup(server: server, namespace: namespace)
+        deletionCleanup = cleanup
+        deletionClient = active
+        // No password, cookie or user ID is saved. A restart retries local cleanup only.
+        UserDefaults.standard.set(try JSONEncoder().encode(cleanup), forKey: Self.cleanupKey)
+        do {
+            try await retryLocalDeletionCleanup()
+        } catch {
+            accountNotice = "工作区账户已删除。此设备的安全存储尚未完成清理，请解锁设备后点按“清理本机账户数据”。"
+        }
+    }
+
+    /// This retries local cleanup only; it never repeats the remote account deletion.
+    func retryLocalDeletionCleanup() async throws {
+        guard let cleanup = deletionCleanup else { return }
+        guard !cleaningDeletionData else { throw NetworkError.custom("正在清理本机账户数据，请等待完成。") }
+        cleaningDeletionData = true
+        defer { cleaningDeletionData = false }
+        // Invalidate in-memory cookies even if removing their Keychain copy fails.
+        var failure: Error?
+        if let deletionClient {
+            do { try await deletionClient.clearSession() } catch { failure = error }
+        } else {
+            do { try await Task.detached { try SecureStore(namespace: "AgentWorkspaceKit.session." + cleanup.server).removeAll() }.value }
+            catch { failure = error }
+        }
+        do { try await Task.detached { try SecureStore(namespace: cleanup.namespace).removeAll() }.value } catch { failure = error }
+        if let failure { localDeletionCleanupNeeded = true; throw failure }
+        deletionCleanup = nil
+        deletionClient = nil
+        UserDefaults.standard.removeObject(forKey: Self.cleanupKey)
+        localDeletionCleanupNeeded = false
+        accountNotice = "工作区账户已删除，此设备的会话、草稿和发送恢复记录已清除。"
+    }
+
+    private func requireAccountIdle() throws {
+        guard !isDeletingAccount, !cleaningDeletionData else { throw NetworkError.custom("正在处理账户数据，请等待结果。") }
     }
 
     func fetchOverview() async throws -> WorkspaceOverview {
@@ -144,6 +236,14 @@ final class NetworkManager: ObservableObject {
         try await perform { try await $0.saveRecordState(agentId: agentId, kind: kind, id: id, deleted: deleted) }
     }
     func fetchActivity() async throws -> RemoteRecord { try await perform { try await $0.fetchActivity() } }
+    func previewContentReport(reportID: String, agentID: String, kind: String, recordID: String) async throws -> RemoteRecord {
+        try await perform { try await $0.previewContentReport(reportID: reportID, agentID: agentID, kind: kind, recordID: recordID) }
+    }
+    func submitContentReport(reportID: String, agentID: String, kind: String, recordID: String, reason: String, comment: String, evidence: String, previewToken: String) async throws -> RemoteRecord {
+        try await perform { try await $0.submitContentReport(reportID: reportID, agentID: agentID, kind: kind, recordID: recordID, reason: reason, comment: comment, evidence: evidence, previewToken: previewToken) }
+    }
+    func fetchContentReports() async throws -> [RemoteRecord] { try await perform { try await $0.fetchContentReports() } }
+    func fetchContentReport(reportID: String) async throws -> RemoteRecord { try await perform { try await $0.fetchContentReport(reportID: reportID) } }
     func fetchAccount() async throws -> RemoteRecord { try await perform { try await $0.fetchAccount() } }
     func resendVerification(email: String) async throws { _ = try await perform { try await $0.resendVerification(email: email) } }
     func requestPasswordReset(email: String) async throws { _ = try await perform { try await $0.requestPasswordReset(email: email) } }
@@ -154,18 +254,20 @@ final class NetworkManager: ObservableObject {
     func approveOnboarding(code: String) async throws -> RemoteRecord { try await perform { try await $0.approveOnboarding(code: code) } }
 
     private func perform<T>(_ operation: (WorkspaceClient) async throws -> T) async throws -> T {
+        try requireAccountIdle()
+        guard deletionCleanup == nil else { throw NetworkError.custom("请先完成本机已删除账户的数据清理。") }
         let epoch = generation
         let active = client
         do {
             let result = try await operation(active)
-            guard generation == epoch else { throw CancellationError() }
+            guard generation == epoch, !isDeletingAccount else { throw CancellationError() }
             return result
         } catch {
             // A delayed response from another account/server must not affect this session.
-            guard generation == epoch else { throw CancellationError() }
+            guard generation == epoch, !isDeletingAccount else { throw CancellationError() }
             let unauthorized: Bool
             if case WorkspaceClientError.unauthorized = error { unauthorized = true }
-            else { unauthorized = (error as? ControlCallError)?.httpStatus == 401 }
+            else { unauthorized = (error as? ControlCallError)?.httpStatus == 401 || (error as? ContentReportError)?.httpStatus == 401 }
             if unauthorized {
                 generation += 1
                 currentUser = nil

@@ -3,6 +3,17 @@ import Combine
 import CryptoKit
 import AgentWorkspaceKit
 
+/// A disclosure snapshot for one account, workspace and Agent in this login session.
+struct AgentSharingContext: Equatable, Identifiable {
+    let server: String
+    let accountID: String
+    let sessionRevision: Int
+    let agentID: String
+    let agentName: String
+    let agentURN: String
+    var id: String { server + "\u{0}" + accountID + "\u{0}" + String(sessionRevision) + "\u{0}" + agentID + "\u{0}" + agentURN }
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     @Published var connections: [WorkspaceConnection] = []
@@ -31,6 +42,9 @@ final class WorkspaceStore: ObservableObject {
     @Published var focusTurnID: String?
     @Published var collaborationFocusID: String?
     @Published var activity: RemoteRecord = [:]
+    @Published private(set) var sharingPermission: AgentSharingContext?
+    private var safetyDecisions: [String: [String: RemoteRecord]] = [:]
+    private var sharingGrant: UUID?
     let demo: Bool
     private let network = NetworkManager.shared
     private var cache: [String: WorkspaceAgent] = [:]
@@ -56,7 +70,7 @@ final class WorkspaceStore: ObservableObject {
     private let accountScope: String
     private let sessionRevision: Int
     private var scopeIsCurrent: Bool {
-        demo || (network.isAuthenticated && sessionRevision == network.sessionRevision && accountScope == network.baseUrl + "\u{0}" + (network.currentUser?.id ?? "signed-out"))
+        demo || (network.isAuthenticated && !network.isDeletingAccount && sessionRevision == network.sessionRevision && accountScope == network.baseUrl + "\u{0}" + (network.currentUser?.id ?? "signed-out"))
     }
 
     init(demo: Bool = false) {
@@ -64,8 +78,7 @@ final class WorkspaceStore: ObservableObject {
         let scope = NetworkManager.shared.baseUrl + "\u{0}" + (NetworkManager.shared.currentUser?.id ?? "signed-out")
         accountScope = scope
         sessionRevision = NetworkManager.shared.sessionRevision
-        let digest = SHA256.hash(data: Data(scope.utf8)).map { String(format: "%02x", $0) }.joined()
-        journal = SecureStore(namespace: "agent-workspace." + digest)
+        journal = SecureStore(namespace: Self.recoveryNamespace(server: NetworkManager.shared.baseUrl, userID: NetworkManager.shared.currentUser?.id ?? "signed-out"))
         #if DEBUG
         if demo {
             workspace = DemoWorkspace.agent; connections = [DemoWorkspace.agent.agent]; selectedAgentID = workspace?.agent.id; conversationID = workspace?.activeConversationId ?? ""
@@ -78,13 +91,111 @@ final class WorkspaceStore: ObservableObject {
         #endif
     }
 
+    static func recoveryNamespace(server: String, userID: String) -> String {
+        let scope = server + "\u{0}" + userID
+        let digest = SHA256.hash(data: Data(scope.utf8)).map { String(format: "%02x", $0) }.joined()
+        return "agent-workspace." + digest
+    }
+
+    var sharingContext: AgentSharingContext? {
+        guard !demo, scopeIsCurrent, let user = network.currentUser, let id = selectedAgentID,
+              let agent = selectedAgent, let workspace, workspace.agent.id == id,
+              !agent.urn.isEmpty, workspace.agent.urn == agent.urn else { return nil }
+        return AgentSharingContext(server: network.baseUrl, accountID: user.id,
+            sessionRevision: network.sessionRevision, agentID: id, agentName: agent.name, agentURN: agent.urn)
+    }
+
+    var hasAgentSharingPermission: Bool {
+        sharingGrant != nil && sharingContext != nil && sharingPermission == sharingContext
+    }
+
+    /// No persistent grant: restart, a new login or switching Agent needs a fresh decision.
+    @discardableResult
+    func allowAgentSharing(_ context: AgentSharingContext) -> Bool {
+        guard scopeIsCurrent, sharingContext == context else { return false }
+        sharingPermission = context
+        sharingGrant = UUID()
+        if error?.hasPrefix("尚未允许向当前 Agent") == true || error?.hasPrefix("共享许可已变化。") == true { error = nil }
+        return true
+    }
+
+    func revokeAgentSharing() {
+        sharingPermission = nil
+        sharingGrant = nil
+    }
+
+    private func sharingIsAllowed(grant: UUID? = nil) -> Bool {
+        guard hasAgentSharingPermission, grant == nil || grant == sharingGrant else {
+            error = "尚未允许向当前 Agent 共享内容。请先查看并明确同意内容共享说明；已有内容仍可阅读。"
+            return false
+        }
+        return true
+    }
+
     var selectedAgent: WorkspaceConnection? { connections.first { $0.id == selectedAgentID } }
     var capabilities: RemoteRecord? { workspace?.snapshots["capabilities"]?.data }
     var turns: [RemoteRecord] { workspace?.conversation?.records("turns") ?? [] }
     var collaboration: RemoteRecord { workspace?.snapshots["collaboration.state"]?.data ?? [:] }
+    var contentSafetyAvailable: Bool { workspace?.contentSafety?.number("version") == 1 }
+    var peerInputSafetyAvailable: Bool {
+        let value = capabilities?.record("peer_content_safety") ?? [:]
+        return value.number("version") == 1 && value.string("mode") == "owner_review" && value["automatic_peer_model_execution"] == .bool(false)
+    }
     var contacts: [RemoteRecord] { currentRecords(method: "contacts.list", key: "contacts").filter { !isRecordHidden(kind: "contact", id: $0.string("contact_id")) } }
     var inbox: [RemoteRecord] { currentRecords(method: "inbox.list", key: "messages") }
     var contactRequests: [RemoteRecord] { currentRecords(method: "contacts.requests", key: "contact_requests") }
+    var blockedPeers: [RemoteRecord] {
+        var peers = latestSafetySnapshot?.data.records("blocked_peers") ?? currentRecords(method: "contacts.list", key: "blocked_peers")
+        for (urn, decision) in verifiedSafetyDecisions {
+                guard decision.number("safety_revision") > latestSafetySnapshotRevision else { continue }
+                peers.removeAll { $0.string("urn") == urn }
+                if decision.bool("blocked") { peers.append(decision) }
+        }
+        return peers
+    }
+    private var latestSafetySnapshot: WorkspaceSnapshot? {
+        [workspace?.snapshots["contacts.list"], workspace?.snapshots["collaboration.state"]].compactMap { $0 }
+            .filter { validSafetyRevision($0.data) != nil }
+            .max {
+                let first = $0.data.number("safety_revision"), second = $1.data.number("safety_revision")
+                return first == second ? $0.time < $1.time : first < second
+            }
+    }
+    private var latestSafetySnapshotRevision: Double {
+        latestSafetySnapshot?.data.number("safety_revision") ?? -1
+    }
+    private func validSafetyRevision(_ record: RemoteRecord) -> Double? {
+        guard let value = record["safety_revision"]?.numberValue,
+              value.isFinite, value >= 0, value <= 9_007_199_254_740_991, value.rounded(.down) == value else { return nil }
+        return value
+    }
+    private var verifiedSafetyDecisions: [String: RemoteRecord] {
+        var decisions = selectedAgentID.flatMap { safetyDecisions[$0] } ?? [:]
+        for operation in actionOperations where operation.phase == "succeeded" && [.contactsBlock, .contactsUnblock].contains(operation.call.method) {
+            let urn = operation.call.params.string("urn")
+            guard let result = operation.result, acceptsAction(operation.call, result: result),
+                  result.number("safety_revision") > (decisions[urn]?.number("safety_revision") ?? -1) else { continue }
+            decisions[urn] = result
+        }
+        return decisions
+    }
+    var pendingContentReviews: [RemoteRecord] {
+        let messageIDs = Set(inbox.map { $0.string("message_id") })
+        return currentRecords(method: "inbox.list", key: "pending_review").filter { !messageIDs.contains($0.string("message_id")) }
+    }
+    func peerIsBlocked(_ urn: String) -> Bool {
+        let latest = latestSafetySnapshot
+        let decision = verifiedSafetyDecisions[urn]
+        if let decision, decision.number("safety_revision") > (latest?.data.number("safety_revision") ?? -1) {
+            return decision.bool("blocked")
+        }
+        if let latest { return latest.data.records("blocked_peers").contains { $0.string("urn") == urn && $0.bool("blocked") } || latest.data.records("contacts").contains { $0.string("urn") == urn && ($0.bool("blocked") || $0.string("connection_status") == "blocked") } }
+        return blockedPeers.contains { $0.string("urn") == urn && $0.bool("blocked") }
+            || contacts.contains { $0.string("urn") == urn && ($0.bool("blocked") || $0.string("connection_status") == "blocked") }
+    }
+    func peerSafetyPending(_ urn: String) -> Bool {
+        uncertainActions.contains { [.contactsBlock, .contactsUnblock].contains($0.call.method) && $0.call.params.string("urn") == urn }
+    }
     var sentMessages: [RemoteRecord] { collaboration.records("sent_messages") }
     var uncertainActions: [WorkspaceOperation] { actionOperations.filter { ["sending", "uncertain"].contains($0.phase) } }
     var policyAccess: Bool { policy?.bool("can_use_workbench") == true }
@@ -107,12 +218,12 @@ final class WorkspaceStore: ObservableObject {
     var pendingCount: Int { collaboration.records("pending_confirmations").count }
     var canSend: Bool {
         guard let workspace else { return false }
-        return !demo && scopeIsCurrent && policyAccess && available(.conversationSend) && workspace.identity.virtualUrn != nil && pairingAllowsSend(capabilities: capabilities, sync: workspace.sync)
+        return !demo && scopeIsCurrent && policyAccess && contentSafetyAvailable && peerInputSafetyAvailable && available(.conversationSend) && workspace.identity.virtualUrn != nil && pairingAllowsSend(capabilities: capabilities, sync: workspace.sync)
     }
     var canSubmit: Bool { canSend && localRecoveryReady && draftHydrated && busy == nil && submission == nil && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && draft.count <= 8000 && draft.utf8.count <= 24000 }
     func available(_ method: RPCMethod) -> Bool { capabilities?.records("methods").contains { $0.string("name") == method.rawValue && $0.bool("available") } ?? false }
     func canAct(_ method: RPCMethod) -> Bool {
-        !demo && scopeIsCurrent && policyAccess && localRecoveryReady && operationsReady && busy == nil && available(method) && workspace?.identity.virtualUrn != nil && pairingAllowsSend(capabilities: capabilities, sync: workspace?.sync ?? .init())
+        !demo && scopeIsCurrent && policyAccess && (!method.requiresContentSharing || (contentSafetyAvailable && peerInputSafetyAvailable)) && localRecoveryReady && operationsReady && busy == nil && available(method) && workspace?.identity.virtualUrn != nil && pairingAllowsSend(capabilities: capabilities, sync: workspace?.sync ?? .init())
     }
 
     func run() async {
@@ -143,6 +254,7 @@ final class WorkspaceStore: ObservableObject {
             connections = overview.connections
             if selectedAgentID == nil || !connections.contains(where: { $0.id == selectedAgentID }) {
                 guard busy == nil else { return }
+                revokeAgentSharing()
                 selectedAgentID = connections.first?.id
                 localRecoveryReady = false
                 draftHydrated = false
@@ -185,6 +297,7 @@ final class WorkspaceStore: ObservableObject {
         busy = nil
         guard scopeIsCurrent else { return }
         generation += 1
+        revokeAgentSharing()
         selectedAgentID = id
         localRecoveryReady = false
         draftHydrated = false
@@ -391,6 +504,7 @@ final class WorkspaceStore: ObservableObject {
 
     func send(retry: Bool = false) async {
         guard scopeIsCurrent, localRecoveryReady, let id = selectedAgentID, let urn = workspace?.identity.virtualUrn, canSend, busy == nil else { return }
+        guard sharingIsAllowed() else { return }
         let item: WorkspaceSubmission
         if retry {
             guard var existing = submission, existing.retryable else { return }
@@ -595,17 +709,25 @@ final class WorkspaceStore: ObservableObject {
 
     private func actionSubject(_ call: PendingCall) -> String {
         if call.method == .contactsAdd { return "contact" }
-        for key in ["approval_id", "request_id", "message_id", "recipient_urn", "action"] {
+        for key in ["approval_id", "request_id", "message_id", "recipient_urn", "urn", "action"] {
             if !call.params.string(key).isEmpty { return call.params.string(key) }
         }
         return ""
     }
 
     func performAction(_ method: RPCMethod, params: RemoteRecord, original: WorkspaceOperation? = nil) async {
-        let writes: Set<RPCMethod> = [.contactsAdd, .contactsRespond, .messagesSend, .inboxMarkRead, .approvalRespond, .collaborationExecute]
+        let writes: Set<RPCMethod> = [.contactsAdd, .contactsRespond, .contactsBlock, .contactsUnblock, .messagesSend, .inboxMarkRead, .inboxReview, .approvalRespond, .collaborationExecute]
         guard writes.contains(method), canAct(method), let id = selectedAgentID else { return }
         guard method != .collaborationExecute || params.string("action") != "describe" else { return }
+        // Read acknowledgements contain only an existing message ID; content-bearing
+        // actions and their retries require the independent sharing permission.
+        let needsSharing = method.requiresContentSharing
+        guard !needsSharing || sharingIsAllowed() else { return }
+        let grant = sharingGrant
         let call = original?.call ?? PendingCall(method: method, params: params)
+        if original == nil, [.contactsBlock, .contactsUnblock].contains(method), peerSafetyPending(params.string("urn")) {
+            error = "这个发送方的屏蔽操作结果待核实。请刷新状态或查看原请求后再决定。"; return
+        }
         if original == nil, uncertainActions.contains(where: { $0.call.method == method && (method == .collaborationExecute || actionSubject($0.call) == actionSubject(call)) }) {
             error = "同一对象已有结果待核实的操作。请先查看最新状态或核实原请求。"; return
         }
@@ -623,6 +745,11 @@ final class WorkspaceStore: ObservableObject {
             if ["succeeded", "failed"].contains(saved.phase) {
                 actionResult = saved.message; busy = nil; return
             }
+            guard !needsSharing || sharingIsAllowed(grant: grant) else {
+                error = "共享许可已变化。原操作记录已保留，本次未继续向 Agent 派发；请核实原请求后重新授权。"
+                busy = nil
+                return
+            }
             let result = try await network.execute(agentId: id, call: call)
             guard scopeIsCurrent, version == generation else { busy = nil; return }
             actionResponse = result
@@ -630,6 +757,10 @@ final class WorkspaceStore: ObservableObject {
                 retryable = false; message = result.string("instruction", default: "Agent 尚不能确认是否已执行，请查看事项和消息记录。")
             } else if acceptsAction(call, result: result) {
                 phase = "succeeded"; retryable = false
+                if [.contactsBlock, .contactsUnblock].contains(method) {
+                    let urn = params.string("urn")
+                    if result.number("safety_revision") > (safetyDecisions[id]?[urn]?.number("safety_revision") ?? -1) { safetyDecisions[id, default: [:]][urn] = result }
+                }
                 message = method == .contactsAdd ? "Agent 已受理好友请求；对方接受后才会建立连接。" : "Agent 已确认处理，最新状态正在同步。"
             } else if !result.string("error").isEmpty || ["not_executed", "unsupported", "unavailable", "denied", "rejected"].contains(result.string("status")) {
                 phase = "failed"; retryable = false; message = result.string("error", default: "Agent 未执行该操作，请检查授权和当前状态。")
@@ -660,8 +791,15 @@ final class WorkspaceStore: ObservableObject {
         switch call.method {
         case .contactsAdd: return result.string("decision") == "allow" && ["requested", "request_sent", "pending", "already_requested", "already_connected", "confirmed", "already_confirmed"].contains(status)
         case .contactsRespond: return result.string("request_id") == params.string("request_id") && status == (params.string("decision") == "accept" ? "accepted" : "rejected")
+        case .contactsBlock, .contactsUnblock:
+            let blocked = call.method == .contactsBlock
+            return result.string("urn") == params.string("urn") && result["blocked"] == .bool(blocked)
+                && status == (blocked ? "blocked" : "unblocked")
+                && validSafetyRevision(result) != nil
+                && (blocked ? result.string("connection_status") == "blocked" : ["connected", "pending", "rejected", "unverified"].contains(result.string("connection_status")))
         case .approvalRespond: return result.string("approval_id") == params.string("approval_id") && status == (params.string("decision") == "approve" ? "approved_once" : "denied") && result.string("decision") == (params.string("decision") == "approve" ? "allow" : "deny")
         case .inboxMarkRead: return result.string("message_id") == params.string("message_id") && (status == "read" || result.bool("read"))
+        case .inboxReview: return result.string("message_id") == params.string("message_id") && status == (params.string("decision") == "approve" ? "approved" : "rejected")
         case .messagesSend: return result.string("message_id") == params.string("message_id") && ["sent", "queued", "accepted"].contains(status)
         case .collaborationExecute: return !result.isEmpty && result.string("error").isEmpty && !["not_executed", "unsupported", "unavailable", "denied", "rejected"].contains(status) && result.string("decision") != "deny"
         default: return false

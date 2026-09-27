@@ -7,39 +7,12 @@ import AppKit
 #endif
 
 extension Color {
-    // Semantic surfaces support both appearance modes and system contrast settings.
-    #if os(macOS)
-    static let brandPrimary = Color(NSColor(name: nil) { appearance in
-        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        return dark
-            ? NSColor(red: 0.30, green: 0.77, blue: 0.73, alpha: 1)
-            : NSColor(red: 0.02, green: 0.43, blue: 0.42, alpha: 1)
-    })
-    #else
-    static let brandPrimary = Color(UIColor { traits in
-        traits.userInterfaceStyle == .dark
-            ? UIColor(red: 0.30, green: 0.77, blue: 0.73, alpha: 1)
-            : UIColor(red: 0.02, green: 0.43, blue: 0.42, alpha: 1)
-    })
-    #endif
-    static let brandButtonBackground = Color(red: 0.02, green: 0.43, blue: 0.42)
-    static let statusSuccess = adaptive(light: (0.04, 0.43, 0.27), dark: (0.34, 0.83, 0.58))
-    static let statusWarning = adaptive(light: (0.60, 0.32, 0.02), dark: (1.0, 0.73, 0.34))
-    static let statusDestructive = adaptive(light: (0.75, 0.15, 0.19), dark: (1.0, 0.46, 0.48))
-
-    private static func adaptive(light: (Double, Double, Double), dark: (Double, Double, Double)) -> Color {
-        #if os(macOS)
-        Color(NSColor(name: nil) { appearance in
-            let c = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
-            return NSColor(red: c.0, green: c.1, blue: c.2, alpha: 1)
-        })
-        #else
-        Color(UIColor { traits in
-            let c = traits.userInterfaceStyle == .dark ? dark : light
-            return UIColor(red: c.0, green: c.1, blue: c.2, alpha: 1)
-        })
-        #endif
-    }
+    // Asset variants adapt to appearance and Increase Contrast on every platform.
+    static let brandPrimary = Color("AccentColor")
+    static let brandButtonBackground = Color("WorkspaceBrandButtonBackground")
+    static let statusSuccess = Color("WorkspaceStatusSuccess")
+    static let statusWarning = Color("WorkspaceStatusWarning")
+    static let statusDestructive = Color("WorkspaceStatusDestructive")
 
     #if os(macOS)
     static let systemGroupedBackground = Color(NSColor.windowBackgroundColor)
@@ -58,6 +31,7 @@ extension Color {
 }
 
 struct WorkspaceCard<Content: View>: View {
+    @Environment(\.colorSchemeContrast) private var contrast
     private let content: Content
     private let padding: CGFloat
 
@@ -73,8 +47,25 @@ struct WorkspaceCard<Content: View>: View {
             .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 18))
             .overlay {
                 RoundedRectangle(cornerRadius: 18)
-                    .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+                    .strokeBorder(Color.primary.opacity(contrast == .increased ? 0.4 : 0.07), lineWidth: 1)
             }
+    }
+}
+
+/// Action rows and metadata become vertical when people request accessibility text sizes.
+struct WorkspaceAdaptiveStack<Content: View>: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    var spacing: CGFloat = 12
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        let layout = dynamicTypeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: spacing))
+            : AnyLayout(HStackLayout(alignment: .center, spacing: spacing))
+        layout {
+            content()
+        }
+        .frame(maxWidth: dynamicTypeSize.isAccessibilitySize ? .infinity : nil, alignment: .leading)
     }
 }
 
@@ -91,13 +82,14 @@ struct WorkspaceField<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(.subheadline.weight(.semibold))
-            content.accessibilityLabel(title)
+            Text(title).font(.subheadline.weight(.semibold)).accessibilityHidden(true)
+            content.accessibilityLabel(title).accessibilityHint(hint ?? "")
             if let hint {
                 Text(hint)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityHidden(true)
             }
         }
     }
@@ -198,13 +190,16 @@ struct WorkspacePrimaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.headline)
-            .frame(maxWidth: .infinity, minHeight: 24)
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+            .frame(maxWidth: .infinity)
+            .workspaceTapTarget()
             .foregroundStyle(foregroundColor)
             .background(backgroundColor, in: RoundedRectangle(cornerRadius: cornerRadius))
             .opacity(!isEnabled || isDisabled ? 0.45 : configuration.isPressed ? 0.8 : 1)
             .contentShape(RoundedRectangle(cornerRadius: cornerRadius))
+            .workspaceHoverEffect()
     }
 }
 
@@ -225,11 +220,42 @@ enum CrossPlatformKeyboardType {
 }
 
 extension View {
+    @ViewBuilder
+    func workspaceScrollDismissesKeyboard() -> some View {
+        #if os(iOS) || os(macOS)
+        self.scrollDismissesKeyboard(.interactively)
+        #else
+        self
+        #endif
+    }
+
+    @ViewBuilder
+    func workspaceHoverEffect() -> some View {
+        #if os(iOS) || os(visionOS)
+        self.hoverEffect(.highlight)
+        #else
+        self
+        #endif
+    }
+
+    /// Apply inside a control's label so the full region participates in hit testing.
+    @ViewBuilder
+    func workspaceTapTarget() -> some View {
+        #if os(visionOS)
+        self.frame(minWidth: 60, minHeight: 60).contentShape(Rectangle())
+        #elseif os(iOS)
+        self.frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+        #else
+        self
+        #endif
+    }
+
     func workspaceInputStyle() -> some View {
         self
             .textFieldStyle(.plain)
             .padding(12)
             .frame(minHeight: 46)
+            .workspaceTapTarget()
             .background(Color.listBackground, in: RoundedRectangle(cornerRadius: 10))
             .overlay {
                 RoundedRectangle(cornerRadius: 10)

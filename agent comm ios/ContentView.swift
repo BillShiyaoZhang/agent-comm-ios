@@ -16,7 +16,7 @@ struct ContentView: View {
             if demo { MainTabView(demo: true) }
             else if !checked {
                 VStack(spacing: 20) {
-                    Image(systemName: "bubble.left.and.bubble.right.fill").font(.largeTitle).foregroundStyle(Color.brandPrimary)
+                    Image(systemName: "bubble.left.and.bubble.right.fill").font(.largeTitle).foregroundStyle(Color.brandPrimary).accessibilityHidden(true)
                     ProgressView("正在恢复工作台…")
                 }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color.listBackground)
             } else if network.isAuthenticated {
@@ -43,6 +43,7 @@ struct ContentView: View {
 
 struct MainTabView: View {
     @StateObject private var store: WorkspaceStore
+    @ObservedObject private var network = NetworkManager.shared
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
@@ -58,7 +59,7 @@ struct MainTabView: View {
         Group {
             if useSidebar {
                 NavigationSplitView {
-                    List {
+                    List(selection: Binding<Int?>(get: { store.tab }, set: { if let tab = $0 { store.tab = tab } })) {
                         Section("工作空间") {
                             sidebarButton("工作台", icon: "square.grid.2x2", tag: 0)
                             sidebarButton("对话", icon: "bubble.left.and.bubble.right", tag: 1)
@@ -68,11 +69,19 @@ struct MainTabView: View {
                         Section("我的 Agent") {
                             ForEach(store.connections) { agent in
                                 Button { Task { await store.selectAgent(agent.id) } } label: {
-                                    HStack { AgentAvatar(name: agent.name, size: 30); Text(agent.name).foregroundStyle(.primary); Spacer(); if agent.id == store.selectedAgentID { Image(systemName: "checkmark").foregroundStyle(Color.brandPrimary) } }
+                                    HStack {
+                                        AgentAvatar(name: agent.name, size: 30)
+                                        Text(agent.name).foregroundStyle(.primary)
+                                        Spacer()
+                                        if agent.id == store.selectedAgentID { Image(systemName: "checkmark").foregroundStyle(Color.brandPrimary).accessibilityHidden(true) }
+                                    }.workspaceTapTarget()
                                 }.disabled(store.busy != nil)
+                                    .accessibilityValue(agent.id == store.selectedAgentID ? "当前 Agent" : "")
+                                    .accessibilityAddTraits(agent.id == store.selectedAgentID ? .isSelected : [])
                             }
                         }
                     }
+                    .listStyle(.sidebar)
                     .navigationTitle("Agent Workspace")
                     .toolbar { ToolbarItem { Button { showSettings = true } label: { Label("设置", systemImage: "gearshape") } } }
                 } detail: { selectedPage }
@@ -93,11 +102,12 @@ struct MainTabView: View {
                 if arguments.contains("--demo-messages") { store.tab = 1 }
                 if arguments.contains("--demo-collaboration") || arguments.contains("--demo-contacts") || arguments.contains("--demo-inbox") { store.tab = 2 }
                 if arguments.contains("--demo-notifications") { store.tab = 3 }
+                if arguments.contains("--demo-focus-approval") { store.tab = 2; store.collaborationFocusID = "approval-1" }
             }
             #endif
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
-        .task(id: scenePhase) { if scenePhase == .active { await store.run() } else { store.saveDraft() } }
+        .task(id: "\(scenePhase)-\(network.isDeletingAccount)") { if scenePhase == .active { await store.run() } else { store.saveDraft() } }
         .onChange(of: store.draft) { _, _ in store.saveDraft() }
         .task(id: store.draft) {
             do { try await Task.sleep(for: .milliseconds(800)); try Task.checkCancellation(); await store.syncDraft() } catch { }
@@ -107,10 +117,17 @@ struct MainTabView: View {
         switch store.tab { case 1: MessagesView(); case 2: CollaborationView(); case 3: NotificationsView(); default: DashboardView() }
     }
     private func sidebarButton(_ title: String, icon: String, tag: Int) -> some View {
-        Button { store.tab = tag } label: {
-            HStack { Label(title, systemImage: icon); Spacer(); if tag == 2 && store.pendingCount > 0 { Text("\(store.pendingCount)").font(.caption.bold()) } }
-                .foregroundStyle(store.tab == tag ? Color.brandPrimary : .primary)
-                .padding(.vertical, 6)
-        }.listRowBackground(store.tab == tag ? Color.brandPrimary.opacity(0.10) : .clear)
+        let count = tag == 2 ? store.pendingCount : tag == 3 ? Int(store.notificationCounts.number("unread")) : 0
+        return NavigationLink(value: tag) {
+            HStack {
+                Label(title, systemImage: icon)
+                if store.tab == tag { Image(systemName: "checkmark").accessibilityHidden(true) }
+            }.workspaceTapTarget()
+        }
+        .tag(tag)
+        .badge(count)
+        .listRowBackground(store.tab == tag ? Color.brandPrimary.opacity(0.12) : .clear)
+        .accessibilityAddTraits(store.tab == tag ? .isSelected : [])
+        .accessibilityValue(count > 0 ? "\(count) 项\(tag == 3 ? "未读" : "待处理")" : "")
     }
 }

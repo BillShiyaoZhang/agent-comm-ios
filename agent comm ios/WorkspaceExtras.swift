@@ -24,22 +24,25 @@ struct PolicyDisclosureView: View {
                             }
                             if compliance && !policy.bool("confirmed") {
                                 Toggle("我已了解平台网关与工作区服务的上述内容可见范围", isOn: $accepted).font(.subheadline)
-                                Button("确认并继续使用") { Task { await store.changePolicy("confirm", displayedHash: policy.string("policy_hash")) } }.buttonStyle(.borderedProminent).disabled(!accepted || store.busy != nil)
+                                Button { Task { await store.changePolicy("confirm", displayedHash: policy.string("policy_hash")) } } label: { Text("确认并继续使用").workspaceTapTarget() }.buttonStyle(.borderedProminent).disabled(!accepted || store.busy != nil)
                             }
                             if policy.bool("paused") {
                                 Text("历史仍可查看。暂停不会收回已披露内容；停止 Agent 披露或撤销工作区访问，仍需在 Agent 所在设备分别设置。").font(.caption).foregroundStyle(.secondary)
                                 if policy.string("status") == "legacy" || !compliance || policy.bool("confirmed") {
-                                    Button("恢复远程控制与同步") { Task { await store.changePolicy("resume") } }.buttonStyle(.bordered).disabled(store.busy != nil)
+                                    Button { Task { await store.changePolicy("resume") } } label: { Text("恢复远程控制与同步").workspaceTapTarget() }.buttonStyle(.bordered).disabled(store.busy != nil)
                                 }
                             } else {
-                                Button(access ? "暂停后续远程控制与同步" : "暂不接受并暂停") { Task { await store.changePolicy("pause") } }.buttonStyle(.bordered).disabled(store.busy != nil)
+                                Button { Task { await store.changePolicy("pause") } } label: { Text(access ? "暂停后续远程控制与同步" : "暂不接受并暂停").workspaceTapTarget() }.buttonStyle(.bordered).disabled(store.busy != nil)
                             }
                         }
-                        if access { Button(expanded ? "收起详情" : "查看详情与控制") { expanded.toggle() }.font(.caption) }
+                        if access {
+                            Button { expanded.toggle() } label: { Text(expanded ? "收起详情" : "查看详情与控制").workspaceTapTarget() }
+                                .font(.caption).accessibilityValue(expanded ? "已展开" : "已收起")
+                        }
                     } else {
                         Label("正在核验平台政策", systemImage: "shield").font(.subheadline.bold())
                         Text(store.policyError ?? "核验前暂停远程控制与同步，已保存内容仍可查看。").font(.caption).foregroundStyle(.secondary)
-                        if store.policyError != nil { Button("重新核验") { Task { await store.refreshPolicy() } }.buttonStyle(.bordered).disabled(store.busy != nil) }
+                        if store.policyError != nil { Button { Task { await store.refreshPolicy() } } label: { Text("重新核验").workspaceTapTarget() }.buttonStyle(.bordered).disabled(store.busy != nil) }
                     }
                 }
             }.onChange(of: store.policy?.string("policy_hash")) { _, _ in accepted = false }
@@ -49,33 +52,45 @@ struct PolicyDisclosureView: View {
 
 struct NotificationsView: View {
     @EnvironmentObject private var store: WorkspaceStore
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     WorkspaceFeedback()
                     Text("未读 \(Int(store.notificationCounts.number("unread"))) · 待处理 \(Int(store.notificationCounts.number("pending")))").font(.subheadline).foregroundStyle(.secondary)
-                    Picker("筛选提醒", selection: $store.notificationFilter) {
-                        Text("全部").tag("all"); Text("未读").tag("unread"); Text("待处理").tag("pending")
-                    }.pickerStyle(.segmented)
+                    if dynamicTypeSize.isAccessibilitySize { filterPicker.pickerStyle(.menu) }
+                    else { filterPicker.pickerStyle(.segmented) }
                     if let error = store.notificationError { InlineNotice(message: error, style: .error) }
                     if store.notifications.isEmpty { EmptyState(title: "暂时没有提醒", message: "需要你决定的事项、收到的消息和对话结果会显示在这里。", systemImage: "bell") }
-                    ForEach(Array(store.notifications.enumerated()), id: \.offset) { _, item in
+                    ForEach(store.notifications.map { NotificationCardItem(data: $0) }) { record in
+                        let item = record.data
                         WorkspaceCard {
                             VStack(alignment: .leading, spacing: 12) {
-                                HStack { Text(item.string("title", default: "Agent 提醒")).font(.headline); Spacer(); RemoteStatus(status: item.string("state")) }
-                                Text(item.string("summary")).textSelection(.enabled)
-                                HStack { Text(item.string("agentName")); Spacer(); Text(Date(timeIntervalSince1970: item.number("updatedAt") / 1000), style: .relative) }.font(.caption).foregroundStyle(.secondary)
-                                HStack {
-                                    Button("查看原内容") { Task { await store.openNotification(item) } }.buttonStyle(.borderedProminent)
+                                WorkspaceAdaptiveStack {
+                                    Text(item.string("title", default: "Agent 提醒")).font(.headline).fixedSize(horizontal: false, vertical: true)
+                                        .accessibilityAddTraits(.isHeader).accessibilityValue(item.bool("unread") ? "未读" : "已读")
+                                    RemoteStatus(status: item.string("state"))
+                                }
+                                Text(item.string("summary")).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                                WorkspaceAdaptiveStack(spacing: 8) {
+                                    Text(item.string("agentName"))
+                                    Text(Date(timeIntervalSince1970: item.number("updatedAt") / 1000), style: .relative)
+                                        .accessibilityLabel("更新时间")
+                                        .accessibilityValue(Date(timeIntervalSince1970: item.number("updatedAt") / 1000).formatted(date: .abbreviated, time: .shortened))
+                                }.font(.caption).foregroundStyle(.secondary)
+                                WorkspaceAdaptiveStack {
+                                    Button { Task { await store.openNotification(item) } } label: { Text("查看原内容").workspaceTapTarget() }.buttonStyle(.borderedProminent)
+                                        .accessibilityLabel("查看「\(item.string("title", default: "Agent 提醒"))」原内容")
                                     if item.bool("unread") {
-                                        Button("标记已读") { Task { await store.markNotificationRead(item) } }.buttonStyle(.bordered)
+                                        Button { Task { await store.markNotificationRead(item) } } label: { Text("标记已读").workspaceTapTarget() }.buttonStyle(.bordered)
+                                            .accessibilityLabel("将「\(item.string("title", default: "Agent 提醒"))」标记已读")
                                     }
                                 }.disabled(store.busy != nil || store.demo)
                             }
                         }
                     }
-                    if store.notificationBefore != nil { Button("加载更早提醒") { Task { await store.refreshNotifications(earlier: true) } }.frame(maxWidth: .infinity) }
+                    if store.notificationBefore != nil { Button { Task { await store.refreshNotifications(earlier: true) } } label: { Text("加载更早提醒").frame(maxWidth: .infinity).workspaceTapTarget() } }
                     Text("标记已读不会批准请求。消息已读须由 Agent 确认；当前原生客户端在打开时更新提醒，后台推送尚未接入。").font(.caption).foregroundStyle(.secondary)
                 }.padding(20).frame(maxWidth: 820).frame(maxWidth: .infinity)
             }.background(Color.listBackground).navigationTitle("提醒")
@@ -83,6 +98,17 @@ struct NotificationsView: View {
                 .onChange(of: store.notificationFilter) { _, _ in Task { await store.refreshNotifications() } }
         }
     }
+
+    private var filterPicker: some View {
+        Picker("筛选提醒", selection: $store.notificationFilter) {
+            Text("全部").tag("all"); Text("未读").tag("unread"); Text("待处理").tag("pending")
+        }
+    }
+}
+
+private struct NotificationCardItem: Identifiable {
+    let data: RemoteRecord
+    var id: String { data.string("agentId") + ":" + data.string("id") }
 }
 
 struct ConnectionManagementView: View {
@@ -90,12 +116,13 @@ struct ConnectionManagementView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var removing = false
+    @FocusState private var editingName: Bool
     var body: some View {
         NavigationStack {
             Form {
                 Section("连接名称") {
-                    TextField("名称", text: $name)
-                    Button("保存名称") { Task { await store.manageConnection(name: name.trimmingCharacters(in: .whitespacesAndNewlines)); if store.error == nil { dismiss() } } }
+                    TextField("名称", text: $name).focused($editingName).submitLabel(.done).onSubmit { editingName = false }
+                    Button("保存名称") { editingName = false; Task { await store.manageConnection(name: name.trimmingCharacters(in: .whitespacesAndNewlines)); if store.error == nil { dismiss() } } }
                         .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || name.count > 120 || store.busy != nil || store.demo)
                 }
                 Section {
@@ -103,7 +130,8 @@ struct ConnectionManagementView: View {
                     Button("移除账户连接", role: .destructive) { removing = true }.disabled(store.busy != nil || store.submission != nil || !store.uncertainActions.isEmpty || store.demo)
                 } footer: { Text("移除会删除此账户保存的连接和同步副本。Agent 本机配对与正在执行的动作需另行处理。") }
                 if let error = store.error { InlineNotice(message: error, style: .error) }
-            }.navigationTitle("管理连接").toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() }.disabled(store.busy != nil) } }
+            }.workspaceScrollDismissesKeyboard()
+                .navigationTitle("管理连接").toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() }.disabled(store.busy != nil) } }
                 .onAppear { name = store.selectedAgent?.name ?? "" }
                 .confirmationDialog("移除连接及此账户中的同步副本？", isPresented: $removing, titleVisibility: .visible) {
                     Button("移除账户连接", role: .destructive) { Task { await store.manageConnection(remove: true); if store.error == nil { dismiss() } } }
@@ -121,12 +149,14 @@ struct OnboardingClaimView: View {
     @State private var error: String?
     @State private var busy = false
     @State private var accepted = false
+    @FocusState private var enteringLink: Bool
     private let network = NetworkManager.shared
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("粘贴一次性连接链接或连接码", text: $link, axis: .vertical).autocorrectionDisabled().crossPlatformAutocapitalization()
+                    TextField("粘贴一次性连接链接或连接码", text: $link, axis: .vertical).lineLimit(1...4).autocorrectionDisabled().crossPlatformAutocapitalization().focused($enteringLink)
+                        .accessibilityLabel("一次性连接链接或连接码")
                     Button("读取连接请求") { Task { await readPreview() } }.disabled(busy || store.demo || link.isEmpty)
                 } header: { Text("从 Agent 所在设备获取链接") } footer: { Text("运行新版连接脚本，将生成的 /connect/ 链接粘贴到这里。链接必须属于当前工作区。") }
                 if let preview {
@@ -148,10 +178,21 @@ struct OnboardingClaimView: View {
                 if let error { InlineNotice(message: error, style: .error) }
                 if !store.policyAccess { Text("请先在工作台核验并确认平台政策。").foregroundStyle(Color.statusWarning) }
                 if busy { ProgressView("正在处理…") }
-            }.navigationTitle("通过链接连接 Agent").toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() }.disabled(busy) } }
+            }.workspaceScrollDismissesKeyboard()
+                .navigationTitle("通过链接连接 Agent")
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() }.disabled(busy) }
+                    #if os(iOS)
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button("完成输入") { enteringLink = false }
+                    }
+                    #endif
+                }
         }.interactiveDismissDisabled(busy).frame(minWidth: 300, idealWidth: 540, minHeight: 500)
     }
     private func readPreview() async {
+        enteringLink = false
         busy = true; error = nil; defer { busy = false }
         do {
             let input = link.trimmingCharacters(in: .whitespacesAndNewlines)

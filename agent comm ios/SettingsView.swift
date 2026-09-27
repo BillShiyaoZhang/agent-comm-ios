@@ -1,4 +1,5 @@
 import SwiftUI
+import AgentWorkspaceKit
 
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
@@ -9,9 +10,12 @@ struct SettingsView: View {
     @State private var testResult: String?
     @State private var testSuccess = false
     @State private var saveError: String?
+    @State private var confirmServerChange = false
+    @FocusState private var serverIsFocused: Bool
+    @AccessibilityFocusState private var resultHasFocus: Bool
 
     private var hasServerChanges: Bool {
-        serverUrl.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/")) != networkManager.baseUrl
+        (try? WorkspaceClient.validateServer(serverUrl).absoluteString) != networkManager.baseUrl
     }
 
     var body: some View {
@@ -34,34 +38,42 @@ struct SettingsView: View {
                     }
                     .padding(.vertical, 6)
                     if networkManager.isAuthenticated { NavigationLink("账户与安全") { AccountSecurityView() } }
+                    if networkManager.isAuthenticated { NavigationLink("举报记录") { ContentReportsView() } }
                 }
 
                 Section {
                     WorkspaceField(title: "工作区地址") {
                         TextField("https://workspace.example.com", text: $serverUrl)
+                            .accessibilityLabel("工作区地址")
                             .crossPlatformAutocapitalization()
                             .autocorrectionDisabled()
                             .crossPlatformKeyboardType(.url)
                             .textFieldStyle(.plain)
                             .padding(.vertical, 6)
+                            .focused($serverIsFocused)
+                            .submitLabel(.done)
+                            .onSubmit { serverIsFocused = false }
                     }
                     Button(action: handleTestConnection) {
                         HStack(spacing: 8) {
                             if testingConnection { ProgressView().controlSize(.small) }
                             Label(testingConnection ? "正在检查…" : "测试连接", systemImage: "network")
                         }
-                        .frame(minHeight: 32)
+                        .workspaceTapTarget()
                     }
                     .disabled(testingConnection || serverUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                     if let testResult {
                         InlineNotice(message: testResult, style: testSuccess ? .success : .error)
+                            .accessibilityFocused($resultHasFocus)
                     }
                     if let saveError {
                         InlineNotice(message: saveError, style: .error)
+                            .accessibilityFocused($resultHasFocus)
                     }
-                    Button("保存工作区地址", action: saveServer)
-                        .frame(minHeight: 32)
+                    Button(action: requestSaveServer) {
+                        Text("保存工作区地址").workspaceTapTarget()
+                    }
                         .disabled(!hasServerChanges || testingConnection || signingOut)
                 } header: {
                     Text("连接设置")
@@ -70,6 +82,11 @@ struct SettingsView: View {
                 }
 
                 Section("使用说明") {
+                    NavigationLink {
+                        WorkspaceDataView()
+                    } label: {
+                        Label("数据与隐私", systemImage: "hand.raised").workspaceTapTarget()
+                    }
                     Label {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("让设备连接到工作区")
@@ -103,7 +120,7 @@ struct SettingsView: View {
                                 if signingOut { ProgressView().controlSize(.small) }
                                 Label(signingOut ? "正在退出…" : "退出登录", systemImage: "rectangle.portrait.and.arrow.right")
                             }
-                            .frame(minHeight: 32)
+                            .workspaceTapTarget()
                         }
                         .disabled(signingOut || testingConnection)
                     } footer: {
@@ -112,11 +129,12 @@ struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
+            .workspaceScrollDismissesKeyboard()
             .navigationTitle("设置")
             .crossPlatformNavigationBarTitleDisplayModeInline()
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { dismiss() }
+                    Button("完成") { dismiss() }.disabled(signingOut)
                 }
             }
             .onAppear { serverUrl = networkManager.baseUrl }
@@ -124,9 +142,30 @@ struct SettingsView: View {
                 testResult = nil
                 saveError = nil
             }
+            .onChange(of: testResult) { _, value in resultHasFocus = value != nil }
+            .onChange(of: saveError) { _, value in resultHasFocus = value != nil }
+            .confirmationDialog("切换工作区？", isPresented: $confirmServerChange, titleVisibility: .visible) {
+                Button("切换并退出当前账户", action: saveServer)
+                Button("取消", role: .cancel) { }
+            } message: {
+                Text("保存这个地址会退出当前账户。你需要在新工作区重新登录；原工作区的数据会保留。")
+            }
         }
         .tint(.brandPrimary)
         .frame(minWidth: 320, idealWidth: 540, idealHeight: 700)
+    }
+
+    private func requestSaveServer() {
+        do {
+            _ = try WorkspaceClient.validateServer(serverUrl)
+            serverIsFocused = false
+            saveError = nil
+            if networkManager.isAuthenticated { confirmServerChange = true }
+            else { saveServer() }
+        } catch {
+            saveError = error.localizedDescription
+            serverIsFocused = true
+        }
     }
 
     private func saveServer() {
@@ -140,7 +179,9 @@ struct SettingsView: View {
     }
 
     private func handleTestConnection() {
+        guard !testingConnection, !signingOut else { return }
         let target = serverUrl
+        serverIsFocused = false
         testingConnection = true
         testResult = nil
         Task {
@@ -159,6 +200,7 @@ struct SettingsView: View {
     }
 
     private func handleLogout() {
+        guard !signingOut else { return }
         signingOut = true
         Task {
             // The client clears local credentials even when the server is unreachable.

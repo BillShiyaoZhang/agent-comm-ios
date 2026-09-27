@@ -17,6 +17,7 @@ struct SyncStatusView: View {
     var body: some View {
         Label(syncText(sync.status), systemImage: syncIcon(sync.status))
             .font(.caption).foregroundStyle(syncColor(sync.status))
+            .fixedSize(horizontal: false, vertical: true)
             .accessibilityLabel("同步状态：" + syncText(sync.status))
     }
 }
@@ -60,9 +61,13 @@ struct WorkspaceFeedback: View {
             if store.demo { InlineNotice(message: "界面演示 · 使用示例数据", style: .info) }
             PolicyDisclosureView()
             if let message = store.connectionError { InlineNotice(message: message, style: .error) }
+            if !store.demo && store.policyAccess && store.capabilities != nil && (!store.contentSafetyAvailable || !store.peerInputSafetyAvailable) {
+                InlineNotice(message: "当前 Web 或 Agent 尚未提供完整的对端内容安全能力。请更新后再发送；已有私人对话仍可查看。", style: .info)
+            }
             if let error = store.error {
                 InlineNotice(message: error, style: .error)
-                Button("重新连接") { Task { await store.refresh(schedule: true) } }.font(.subheadline).disabled(store.busy != nil)
+                Button { Task { await store.refresh(schedule: true) } } label: { Text("重新连接").workspaceTapTarget() }
+                    .font(.subheadline).disabled(store.busy != nil)
             }
             if let result = store.actionResult { InlineNotice(message: result, style: .info) }
             if store.busy != nil { ProgressView(store.busy == "conversation.send" ? "等待 Agent 受理…" : "正在更新…").font(.caption).frame(maxWidth: .infinity, alignment: .leading) }
@@ -73,18 +78,23 @@ struct AgentPicker: View {
     @EnvironmentObject private var store: WorkspaceStore
     var body: some View {
         Menu {
-            ForEach(store.connections) { agent in Button { Task { await store.selectAgent(agent.id) } } label: { Label(agent.name, systemImage: agent.id == store.selectedAgentID ? "checkmark.circle" : "circle") } }
+            ForEach(store.connections) { agent in
+                Button { Task { await store.selectAgent(agent.id) } } label: { Label(agent.name, systemImage: agent.id == store.selectedAgentID ? "checkmark.circle" : "circle") }
+                    .accessibilityValue(agent.id == store.selectedAgentID ? "当前 Agent" : "")
+            }
         } label: {
             HStack(spacing: 10) {
                 AgentAvatar(name: store.selectedAgent?.name ?? "A", size: 34)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(store.selectedAgent?.name ?? "选择 Agent").font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
                     if let sync = store.workspace?.sync { SyncStatusView(sync: sync) }
                 }
                 Spacer()
-                Image(systemName: "chevron.up.chevron.down").font(.caption).foregroundStyle(.secondary)
-            }.padding(12).background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 16))
+                Image(systemName: "chevron.up.chevron.down").font(.caption).foregroundStyle(.secondary).accessibilityHidden(true)
+            }.padding(12).workspaceTapTarget().background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 16))
         }.disabled(store.busy != nil || store.connections.isEmpty).accessibilityLabel("切换 Agent")
+            .accessibilityValue([store.selectedAgent?.name, store.workspace.map { syncText($0.sync.status) }].compactMap { $0 }.joined(separator: "，"))
     }
 }
 struct CopyLabel: View {
@@ -92,9 +102,10 @@ struct CopyLabel: View {
     var title = "复制"
     @State private var copied = false
     var body: some View {
-        Button { Clipboard.copy(text: value); copied = true } label: { Label(copied ? "已复制" : title, systemImage: copied ? "checkmark" : "doc.on.doc") }
-            .font(.caption).buttonStyle(.bordered).accessibilityLabel(copied ? "已复制" : title)
-            .task(id: copied) { if copied { try? await Task.sleep(for: .seconds(2)); copied = false } }
+        Button { Clipboard.copy(text: value); copied = true } label: { Label(copied ? "已复制" : title, systemImage: copied ? "checkmark" : "doc.on.doc").workspaceTapTarget() }
+            .font(.caption).buttonStyle(.bordered).accessibilityLabel(title)
+            .accessibilityValue(copied ? "已复制" : "")
+            .onChange(of: value) { _, _ in copied = false }
     }
 }
 struct SnapshotDetails: View {

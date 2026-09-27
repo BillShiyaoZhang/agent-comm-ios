@@ -5,6 +5,8 @@ enum CollaborationSection: String, CaseIterable { case tasks = "事项", contact
 
 struct CollaborationView: View {
     @EnvironmentObject private var store: WorkspaceStore
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var section = CollaborationSection.tasks
     @State private var query = ""
 
@@ -17,9 +19,7 @@ struct CollaborationView: View {
                         EmptyState(title: "协作从连接开始", message: "添加 Agent 后，联系人、协作事项和收件箱会汇集在这里。", systemImage: "person.2")
                     } else {
                         AgentPicker()
-                        Picker("查看内容", selection: $section) {
-                            ForEach(CollaborationSection.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                        }.pickerStyle(.segmented)
+                        sectionPicker
                         WorkspaceFeedback()
                         SocialActionFeedback()
                         if let last = snapshot?.time {
@@ -28,10 +28,16 @@ struct CollaborationView: View {
                         }
                         if snapshot == nil {
                             EmptyState(title: "等待首次同步", message: "完成本机配对后，Agent 开放的数据会显示在这里。", systemImage: "arrow.triangle.2.circlepath")
-                            Button("查看连接设置") { store.tab = 0 }.buttonStyle(.bordered).frame(maxWidth: .infinity)
+                            Button { store.tab = 0 } label: { Text("查看连接设置").workspaceTapTarget() }.buttonStyle(.bordered).frame(maxWidth: .infinity)
                         } else {
                             Group {
-                                switch section { case .tasks: tasks; case .contacts: contacts; case .inbox: inbox }
+                                switch section {
+                                case .tasks:
+                                    if store.contentSafetyAvailable || store.demo { tasks }
+                                    else { InlineNotice(message: "当前工作区尚未提供对端内容审核。请更新 Web 服务；联系人安全设置仍可使用。", style: .info) }
+                                case .contacts: contacts
+                                case .inbox: inbox
+                                }
                             }.id(store.selectedAgentID)
                             if let data = snapshot?.data { SnapshotDetails(data: data) }
                         }
@@ -45,7 +51,8 @@ struct CollaborationView: View {
                     else { section = .tasks }
                     try? await Task.sleep(for: .milliseconds(100))
                     guard !Task.isCancelled else { return }
-                    withAnimation { proxy.scrollTo(focusTarget(for: id), anchor: .top) }
+                    if reduceMotion { proxy.scrollTo(focusTarget(for: id), anchor: .top) }
+                    else { withAnimation { proxy.scrollTo(focusTarget(for: id), anchor: .top) } }
                 }
                 .refreshable { await store.refresh(schedule: true) }
                 .onAppear {
@@ -59,12 +66,31 @@ struct CollaborationView: View {
                 .navigationTitle("协作")
                 .toolbar {
                     ToolbarItem {
-                        Button { Task { await store.invoke(method) } } label: { Label("读取最新内容", systemImage: "arrow.clockwise") }
+                        Button { Task { await store.invoke(method) } } label: { Label("读取最新内容", systemImage: "arrow.clockwise").workspaceTapTarget() }
                             .disabled(!store.available(method) || store.busy != nil || store.demo)
                     }
                 }
             }
         }
+    }
+
+    @ViewBuilder private var sectionPicker: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            Picker("查看内容", selection: $section) {
+                ForEach(CollaborationSection.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }.pickerStyle(.menu).workspaceTapTarget()
+        } else {
+            #if os(iOS)
+            segmentedSectionPicker.accessibilityShowsLargeContentViewer()
+            #else
+            segmentedSectionPicker
+            #endif
+        }
+    }
+    private var segmentedSectionPicker: some View {
+        Picker("查看内容", selection: $section) {
+            ForEach(CollaborationSection.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+        }.pickerStyle(.segmented).workspaceTapTarget()
     }
 
     private var method: RPCMethod {
@@ -99,11 +125,12 @@ struct CollaborationView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     Label("\(approvals.count) 项需要你确认", systemImage: "hand.raised.fill").font(.headline).foregroundStyle(Color.statusWarning)
                     Text("核对完整问题后明确选择。阅读、聊天回复和已读状态不会授予权限。").font(.subheadline).foregroundStyle(.secondary)
-                    ForEach(Array(approvals.enumerated()), id: \.offset) { _, approval in ApprovalRequestCard(approval: approval).id(approval.string("approval_id")) }
+                    ForEach(socialRecordRows(approvals, key: "approval_id")) { item in ApprovalRequestCard(approval: item.data).id(item.data.string("approval_id")) }
                 }.padding(18).background(Color.statusWarning.opacity(0.09), in: RoundedRectangle(cornerRadius: 20))
             }
             let invitations = collaborationView.records("invitations").filter { !store.isRecordHidden(kind: "collaboration", id: $0.string("message_id")) && !store.isRecordHidden(kind: "collaboration", id: $0.string("collaboration_id")) }
-            ForEach(Array(invitations.enumerated()), id: \.offset) { _, invitation in
+            ForEach(socialRecordRows(invitations, key: "message_id", fallbackKeys: ["collaboration_id"])) { item in
+                let invitation = item.data
                 WorkspaceCard {
                     VStack(alignment: .leading, spacing: 10) {
                         Label("收到协作邀请 · 对端声明", systemImage: "envelope.open").font(.caption).foregroundStyle(.secondary)
@@ -120,18 +147,20 @@ struct CollaborationView: View {
             if records.isEmpty && approvals.isEmpty && allOperations.isEmpty && collaborations.isEmpty && invitations.isEmpty {
                 EmptyState(title: "暂时没有协作事项", message: "交给 Agent 的协作事项和待确认请求，会在这里汇集。", systemImage: "checklist")
             }
-            ForEach(Array(records.enumerated()), id: \.offset) { _, task in
+            ForEach(socialRecordRows(records, key: "task_id")) { item in
+                let task = item.data
                 CollaborationTaskCard(task: task, collaboration: collaborations.first { $0.string("task_id") == task.string("task_id") }, operations: allOperations.filter { $0.string("task_id") == task.string("task_id") }, data: data)
                     .id(task.string("task_id"))
             }
-            ForEach(Array(collaborations.filter { collaboration in !records.contains { $0.string("task_id") == collaboration.string("task_id") } }.enumerated()), id: \.offset) { _, collaboration in
+            ForEach(socialRecordRows(collaborations.filter { collaboration in !records.contains { $0.string("task_id") == collaboration.string("task_id") } }, key: "collaboration_id", fallbackKeys: ["task_id"])) { item in
+                let collaboration = item.data
                 CollaborationTaskCard(task: ["task_id": collaboration["task_id"] ?? .string(collaboration.string("collaboration_id"))], collaboration: collaboration, operations: allOperations.filter { $0.string("collaboration_id") == collaboration.string("collaboration_id") }, data: data)
                     .id(collaboration.string("collaboration_id"))
             }
             let orphaned = allOperations.filter { operation in
                 !store.isRecordHidden(kind: "collaboration", id: operation.string("task_id")) && !store.isRecordHidden(kind: "collaboration", id: operation.string("collaboration_id")) && !records.contains { $0.string("task_id") == operation.string("task_id") } && !collaborations.contains { $0.string("collaboration_id") == operation.string("collaboration_id") }
             }
-            ForEach(Array(orphaned.enumerated()), id: \.offset) { _, operation in WorkspaceCard { OperationView(operation: operation) }.id(operation.string("operation_id")) }
+            ForEach(socialRecordRows(orphaned, key: "operation_id")) { item in WorkspaceCard { OperationView(operation: item.data) }.id(item.data.string("operation_id")) }
             MeetingGoalForm()
             CollaborationActionForm()
             DeletedSocialRecordsView(kind: "collaboration")
@@ -143,26 +172,37 @@ struct CollaborationView: View {
             AddContactForm()
             ContactRequestsView()
             if !store.contacts.isEmpty {
-                HStack { Image(systemName: "magnifyingglass").foregroundStyle(.secondary); TextField("搜索姓名、别名或 URN", text: $query).autocorrectionDisabled() }
+                HStack { Image(systemName: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true); TextField("搜索姓名、别名或 URN", text: $query).autocorrectionDisabled().accessibilityLabel("搜索联系人") }
                     .padding(14).background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 14))
             }
             let visible = store.contacts.filter { query.isEmpty || ($0.string("contact_id") + " " + $0.string("alias") + " " + $0.string("urn") + " " + $0.strings("aliases").joined(separator: " ")).localizedCaseInsensitiveContains(query) }
             if visible.isEmpty {
                 EmptyState(title: query.isEmpty ? "联系人会出现在这里" : "没有匹配的联系人", message: query.isEmpty ? "添加联系人并等待对方接受，双方即可互发普通消息。" : "试试其他姓名、别名或 URN。", systemImage: "person.crop.circle.badge.plus")
             }
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 280))], spacing: 12) {
-                ForEach(Array(visible.enumerated()), id: \.offset) { _, contact in ContactCard(contact: contact, syncedAt: snapshot?.time ?? 0).id(contact.string("contact_id")) }
+            LazyVGrid(columns: dynamicTypeSize.isAccessibilitySize ? [GridItem(.flexible())] : [GridItem(.adaptive(minimum: 280))], spacing: 12) {
+                ForEach(socialRecordRows(visible, key: "contact_id", fallbackKeys: ["urn"])) { item in ContactCard(contact: item.data, syncedAt: snapshot?.time ?? 0).id(item.data.string("contact_id")) }
             }
             DeletedSocialRecordsView(kind: "contact")
+            BlockedPeersView()
         }
     }
 
     private var inbox: some View {
         VStack(alignment: .leading, spacing: 14) {
             PeerMessageForm()
-            if store.inbox.isEmpty { EmptyState(title: "收件箱很安静", message: "来自其他 Agent 的消息，会在这里显示。", systemImage: "tray") }
+            if store.inbox.isEmpty && store.pendingContentReviews.isEmpty { EmptyState(title: "收件箱很安静", message: "来自其他 Agent 的消息，会在这里显示。", systemImage: "tray") }
             else { Text("消息来自对端 Agent，内容仍需核实；涉及授权，请在「事项」中核对完整问题。").font(.caption).foregroundStyle(.secondary) }
-            ForEach(Array(store.inbox.reversed().enumerated()), id: \.offset) { _, message in InboxMessageCard(message: message).id(message.string("message_id")) }
+            ForEach(socialRecordRows(Array(store.inbox.reversed()), key: "message_id")) { item in InboxMessageCard(message: item.data).id(item.data.string("message_id")) }
+            ForEach(socialRecordRows(store.pendingContentReviews, key: "message_id")) { item in
+                WorkspaceCard {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(item.data.string("sender_urn")).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        PendingContentReview(messageID: item.data.string("message_id"))
+                        PeerSafetyControls(urn: item.data.string("sender_urn"))
+                        ContentReportButton(kind: "inbox", recordID: item.data.string("message_id"))
+                    }
+                }
+            }
             SentMessagesView()
         }
     }
@@ -181,9 +221,8 @@ struct CollaborationTaskCard: View {
             VStack(alignment: .leading, spacing: 14) {
                 let scope = task.record("scope")
                 let terms = collaboration?.record("terms") ?? [:]
-                HStack(alignment: .top) {
+                WorkspaceAdaptiveStack {
                     Text(scope.string("topic", default: terms.string("topic", default: scope.string("purpose", default: "协作事项")))).font(.headline)
-                    Spacer()
                     StatusBadge(text: phaseText, color: collaboration?.string("phase") == "closed" ? .statusSuccess : .statusWarning)
                 }
                 summary("目标", scope.string("purpose", default: scope.string("topic", default: terms.string("topic", default: "当前记录未提供"))))
@@ -191,7 +230,7 @@ struct CollaborationTaskCard: View {
                 summary("下一步", nextStep)
                 summary("结果与完成范围", result)
                 if let waiting = collaboration?.string("waiting_reason"), !waiting.isEmpty { Text(socialWaitingLabel(waiting)).font(.caption).foregroundStyle(Color.statusWarning) }
-                DisclosureGroup("授权范围、方案与来源", isExpanded: $detailsOpen) {
+                DisclosureGroup(isExpanded: $detailsOpen) {
                     VStack(alignment: .leading, spacing: 12) {
                         if let peer = collaboration?.string("peer_urn"), !peer.isEmpty { summary("确切接收方", peer) }
                         let participants = scope.strings("participant_ids")
@@ -214,26 +253,28 @@ struct CollaborationTaskCard: View {
                             Text(collaboration?.bool("agreement_synced") == true ? "已有对端同步回执 · 尚未创建日历" : "仍待对端同步回执 · 尚未创建日历").font(.caption).foregroundStyle(.secondary)
                         }
                         let resources = data.records("resources").filter { scope.strings("resource_ids").contains($0.string("resource_id")) }
-                        ForEach(Array(resources.enumerated()), id: \.offset) { _, resource in
-                            DisclosureGroup(resource.string("title", default: "允许分享的资料")) {
+                        ForEach(socialRecordRows(resources, key: "resource_id")) { item in
+                            let resource = item.data
+                            DisclosureGroup {
                                 VStack(alignment: .leading, spacing: 8) {
                                     Text(resource.string("text")).font(.subheadline).textSelection(.enabled)
                                     let source = resource.record("provenance")
                                     if !source.isEmpty { SnapshotDetails(data: source) }
                                     Text("允许分享不等于已经披露；实际发送证据见操作记录。").font(.caption).foregroundStyle(.secondary)
                                 }.padding(.top, 8)
-                            }
+                            } label: { Text(resource.string("title", default: "允许分享的资料")).frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }
                         }
-                        ForEach(Array(operations.enumerated()), id: \.offset) { _, operation in OperationView(operation: operation).id(operation.string("operation_id")) }
+                        ForEach(socialRecordRows(operations, key: "operation_id")) { item in OperationView(operation: item.data).id(item.data.string("operation_id")) }
                         Text("事项 · " + task.string("task_id")).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                         if let collaboration, !collaboration.string("collaboration_id").isEmpty {
                             Text("协作 · " + collaboration.string("collaboration_id")).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                            ContentReportButton(kind: "collaboration", recordID: collaboration.string("collaboration_id"))
                         }
                         let source = task.record("source_context").isEmpty ? collaboration?.record("source_context") ?? [:] : task.record("source_context")
                         RelatedConversationLink(source: source)
                         SocialRecordAction(kind: "collaboration", recordID: task.string("task_id", default: collaboration?.string("collaboration_id") ?? ""), title: scope.string("topic", default: terms.string("topic", default: "协作事项")))
                     }.padding(.top, 10)
-                }.font(.subheadline)
+                } label: { Text("授权范围、方案与来源").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }.font(.subheadline)
             }
         }.task(id: store.collaborationFocusID) {
             if let id = store.collaborationFocusID, id == collaboration?.string("collaboration_id") || operations.contains(where: { $0.string("operation_id") == id }) { detailsOpen = true }
@@ -241,6 +282,7 @@ struct CollaborationTaskCard: View {
     }
     @ViewBuilder private func summary(_ label: String, _ text: String) -> some View {
         VStack(alignment: .leading, spacing: 4) { Text(label).font(.caption).foregroundStyle(.secondary); Text(text).font(.subheadline).textSelection(.enabled) }
+            .accessibilityElement(children: .combine)
     }
     private var phaseText: String {
         guard let collaboration else { return stateText(task.string("status")) }
@@ -280,7 +322,7 @@ struct OperationView: View {
     let operation: RemoteRecord
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack { Text(socialOperationLabel(operation)).font(.caption.bold()); Spacer(); RemoteStatus(status: operation.string("status")) }
+            WorkspaceAdaptiveStack { Text(socialOperationLabel(operation)).font(.caption.bold()); RemoteStatus(status: operation.string("status")) }
             if !operation.string("text").isEmpty { Text(operation.string("text")).font(.subheadline).textSelection(.enabled) }
             if operation.string("status") == "accepted" { Text("本机队列已接收；尚不代表对方同意或事项完成。").font(.caption).foregroundStyle(.secondary) }
             if operation.string("kind") == "join" && operation.string("status") == "denied" { Text("不加入仅记录本方决定，尚未发送专用拒绝通知。").font(.caption).foregroundStyle(.secondary) }

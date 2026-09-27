@@ -5,6 +5,7 @@ struct MessagesView: View {
     @EnvironmentObject private var store: WorkspaceStore
     @State private var history = false
     @State private var showPairing = false
+    @State private var sharingDisclosure: AgentSharingContext?
     @State private var nearBottom = true
     @State private var hasNewResult = false
     @State private var lastReadKey = ""
@@ -13,7 +14,17 @@ struct MessagesView: View {
     @State private var focusHandlingKey: String?
     @State private var viewSessionRevision = NetworkManager.shared.sessionRevision
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @FocusState private var composing: Bool
+    private var composerPreview: Bool {
+        #if DEBUG
+        store.demo && ProcessInfo.processInfo.arguments.contains("--demo-composer")
+        #else
+        false
+        #endif
+    }
     var body: some View {
         NavigationStack {
             Group {
@@ -21,7 +32,7 @@ struct MessagesView: View {
                     EmptyState(title: "先连接一个 Agent", message: "在工作台添加连接并完成本机配对，就能在这里继续对话。", systemImage: "bubble.left.and.bubble.right")
                 } else {
                     VStack(spacing: 0) {
-                        AgentPicker().padding(.horizontal, 16).padding(.bottom, 8)
+                        if !dynamicTypeSize.isAccessibilitySize { AgentPicker().padding(.horizontal, 16).padding(.bottom, 8) }
                         transcript
                         composer
                     }
@@ -30,29 +41,47 @@ struct MessagesView: View {
                 .navigationTitle("对话")
                 .crossPlatformNavigationBarTitleDisplayModeInline()
                 .toolbar {
+                    ToolbarItem { Button { sharingDisclosure = store.sharingContext } label: { Label("管理共享授权", systemImage: "hand.raised") }.disabled(store.sharingContext == nil) }
                     ToolbarItem { Button { history = true } label: { Label("历史对话", systemImage: "clock.arrow.circlepath") }.disabled(store.workspace == nil) }
                     ToolbarItem { Button { Task { await store.selectConversation(nil) } } label: { Label("新对话", systemImage: "square.and.pencil") }.disabled(store.busy != nil || store.submission != nil || store.workspace == nil || store.demo) }
+                    #if os(iOS)
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button("完成输入") { composing = false }
+                    }
+                    #endif
                 }
                 .sheet(isPresented: $history) { ConversationHistoryView() }
+                .sheet(item: $sharingDisclosure) { AgentSharingPermissionView(context: $0) }
                 .sheet(isPresented: $showPairing) { NavigationStack { ScrollView { PairingView().padding() }.navigationTitle("连接与权限").toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { showPairing = false } } } } }
+                .task {
+                    #if DEBUG
+                    if composerPreview && ProcessInfo.processInfo.arguments.contains("--demo-keyboard") { composing = true }
+                    #endif
+                }
         }
     }
     private var transcript: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 22) {
+                    if dynamicTypeSize.isAccessibilitySize { AgentPicker() }
                     WorkspaceFeedback()
                     if let focusError { InlineNotice(message: focusError, style: .error) }
                     if let readError {
                         InlineNotice(message: readError, style: .error)
-                        Button("重试已读同步") { Task { await markVisibleRead() } }.font(.caption)
+                        Button { Task { await markVisibleRead() } } label: { Text("重试已读同步").workspaceTapTarget() }.font(.caption)
                     }
-                    if store.hasEarlierTurns { Button(store.busy == "earlier" ? "正在读取…" : "加载更早记录") { Task { await store.loadEarlier() } }.font(.caption).frame(maxWidth: .infinity).disabled(store.busy != nil) }
+                    if store.hasEarlierTurns {
+                        Button { Task { await store.loadEarlier() } } label: { Text(store.busy == "earlier" ? "正在读取…" : "加载更早记录").frame(maxWidth: .infinity).workspaceTapTarget() }
+                            .font(.caption).disabled(store.busy != nil)
+                    }
                     if store.turns.isEmpty && store.submission == nil {
                         EmptyState(title: store.conversationID.isEmpty ? "有什么想一起推进的？" : "正在接续这个对话", message: store.conversationID.isEmpty ? "把想法、问题，或下一件要做的事告诉你的 Agent。" : "已保存的记录与最新进展会自动同步到这里。", systemImage: "sparkle")
                             .padding(.top, 28)
                         if store.canSend {
-                            Button("帮我梳理今天的待办") { store.draft = "帮我梳理今天的待办"; composing = true }.buttonStyle(.bordered).frame(maxWidth: .infinity)
+                            Button { store.draft = "帮我梳理今天的待办"; composing = true } label: { Text("帮我梳理今天的待办").workspaceTapTarget() }
+                                .buttonStyle(.bordered).frame(maxWidth: .infinity)
                         }
                     }
                     ForEach(store.turns.map { ConversationTurn(data: $0) }) { turn in
@@ -62,6 +91,7 @@ struct MessagesView: View {
                     Color.clear.frame(height: 1).id("end")
                 }.padding(20).frame(maxWidth: 820).frame(maxWidth: .infinity)
             }
+            .workspaceScrollDismissesKeyboard()
             .defaultScrollAnchor(.bottom, for: .initialOffset)
             .onScrollGeometryChange(for: Bool.self) { geometry in
                 geometry.contentSize.height - (geometry.contentOffset.y + geometry.containerSize.height) < 100
@@ -69,9 +99,12 @@ struct MessagesView: View {
                 nearBottom = value
                 if value { hasNewResult = false }
             }
-            .overlay(alignment: .bottom) {
+            .safeAreaInset(edge: .bottom) {
                 if hasNewResult {
-                    Button("查看最新进展 ↓") { proxy.scrollTo("end", anchor: .bottom); hasNewResult = false }.buttonStyle(.borderedProminent).padding(8)
+                    Button { proxy.scrollTo("end", anchor: .bottom); hasNewResult = false } label: {
+                        Label("查看最新进展", systemImage: "arrow.down").workspaceTapTarget()
+                    }.buttonStyle(.borderedProminent).padding(8)
+                        .accessibilityHint("跳转到对话底部")
                 }
             }
             .onChange(of: store.turns) { old, new in
@@ -79,7 +112,7 @@ struct MessagesView: View {
                     Task { await focusTurn(using: proxy) }
                 }
                 guard store.busy != "earlier", old != new, store.focusTurnID == nil else { return }
-                if nearBottom { proxy.scrollTo("end", anchor: .bottom) } else { hasNewResult = true }
+                if nearBottom && !voiceOverEnabled { proxy.scrollTo("end", anchor: .bottom) } else { hasNewResult = true }
             }
             .onChange(of: store.submission) { _, new in
                 if new?.phase == "sending" { proxy.scrollTo("end", anchor: .bottom) }
@@ -142,49 +175,68 @@ struct MessagesView: View {
         await Task.yield()
         guard !Task.isCancelled, store.focusTurnID == id, store.conversationID == conversationID else { return }
         nearBottom = false; hasNewResult = false
-        withAnimation { proxy.scrollTo(id, anchor: .center) }
+        if reduceMotion { proxy.scrollTo(id, anchor: .center) }
+        else { withAnimation { proxy.scrollTo(id, anchor: .center) } }
         do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
         if store.focusTurnID == id && store.conversationID == conversationID { store.focusTurnID = nil }
     }
     @ViewBuilder private var composer: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if store.canSend {
-                HStack(alignment: .bottom, spacing: 12) {
-                    TextField("告诉 Agent 你想做什么…", text: $store.draft, axis: .vertical).lineLimit(2...6).focused($composing).disabled(store.submission != nil)
+            if store.canSend || composerPreview {
+                WorkspaceAdaptiveStack(spacing: 12) {
+                    TextField("告诉 Agent 你想做什么…", text: $store.draft, axis: .vertical).lineLimit(1...(dynamicTypeSize.isAccessibilitySize ? 2 : 6)).focused($composing).disabled(store.submission != nil)
+                        .font(.body)
                         .padding(12).background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 16)).overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.secondary.opacity(0.15)))
-                        .accessibilityLabel("消息内容")
-                    Button { composing = false; Task { await store.send() } } label: {
-                        Image(systemName: "arrow.up").font(.title3.bold()).frame(width: 46, height: 46)
+                        .accessibilityLabel("消息内容，发送给 \(store.selectedAgent?.name ?? "Agent")")
+                    Button { requestSend() } label: {
+                        Group {
+                            if dynamicTypeSize.isAccessibilitySize { Label("发送", systemImage: "arrow.up") }
+                            else { Image(systemName: "arrow.up").font(.title3.bold()) }
+                        }.workspaceTapTarget()
                     }.buttonStyle(.borderedProminent).clipShape(RoundedRectangle(cornerRadius: 16)).disabled(!store.canSubmit).accessibilityLabel("发送消息")
+                        .accessibilityHint(store.hasAgentSharingPermission ? "发送给当前 Agent" : "先查看并决定是否允许向当前 Agent 共享内容")
                         .keyboardShortcut(.return, modifiers: .command)
                 }
-                HStack {
-                    Text("受理后自动同步结果；需要授权的事项会展示具体确认问题。").font(.caption2).foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
-                    if store.draft.count > 7000 || store.draft.utf8.count > 23000 { Text("\(store.draft.count)/8000").font(.caption2).foregroundStyle(store.draft.count > 8000 || store.draft.utf8.count > 24000 ? Color.statusDestructive : .secondary) }
+                WorkspaceAdaptiveStack(spacing: 8) {
+                    if !composing || !dynamicTypeSize.isAccessibilitySize {
+                        Text(composerPreview ? "界面演示 · 输入仅供布局检查，发送功能已停用" : "受理后自动同步结果；需要授权的事项会展示具体确认问题。").font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if store.draft.count > 7000 || store.draft.utf8.count > 23000 {
+                        Text("\(store.draft.count)/8000").font(.caption2).foregroundStyle(store.draft.count > 8000 || store.draft.utf8.count > 24000 ? Color.statusDestructive : .secondary)
+                            .accessibilityLabel("消息字数")
+                            .accessibilityValue("\(store.draft.count)，最多 8000 字；最多 24000 字节")
+                    }
                 }
             } else if store.demo {
                 Label("界面演示 · 发送功能已停用", systemImage: "eye").font(.caption).foregroundStyle(.secondary)
             } else {
-                HStack(alignment: .top, spacing: 12) {
-                    Image(systemName: "lock.shield").foregroundStyle(Color.brandPrimary)
+                WorkspaceAdaptiveStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(deniedTitle).font(.subheadline.bold())
-                        Text(deniedMessage).font(.caption).foregroundStyle(.secondary)
+                        Label(deniedTitle, systemImage: "lock.shield").font(.subheadline.bold())
+                        Text(deniedMessage).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
-                    Spacer()
-                    Button(store.policyAccess ? "查看设置" : "查看政策") {
+                    Button {
                         if store.policyAccess { showPairing = true } else { store.tab = 0 }
-                    }.font(.caption)
+                    } label: { Text(store.policyAccess ? "查看设置" : "查看政策").workspaceTapTarget() }.font(.caption)
                 }
             }
         }.padding(16).frame(maxWidth: 860).frame(maxWidth: .infinity).background(.bar)
     }
+    private func requestSend(retry: Bool = false) {
+        composing = false
+        guard store.hasAgentSharingPermission else {
+            sharingDisclosure = store.sharingContext
+            return
+        }
+        Task { await store.send(retry: retry) }
+    }
     private var deniedTitle: String {
+        if store.policyAccess && store.capabilities != nil && (!store.contentSafetyAvailable || !store.peerInputSafetyAvailable) { return "需要更新工作区或 Agent" }
         if !store.policyAccess { return store.policy?.bool("paused") == true ? "远程控制已暂停" : "等待政策核验与确认" }
         return store.capabilities == nil || store.workspace?.sync.status == "needs_pairing" ? "完成配对后开始对话" : "发送权限尚未开放"
     }
     private var deniedMessage: String {
+        if store.policyAccess && store.capabilities != nil && (!store.contentSafetyAvailable || !store.peerInputSafetyAvailable) { return "当前版本未提供完整的对端内容安全能力，新的发送已暂停。请更新 Web 和 Agent；已保存的私人对话仍可查看。" }
         if !store.policyAccess { return store.policyError ?? "已保存的对话仍可查看。请在工作台核验平台政策，并确认或恢复远程控制。" }
         return "已保存的对话仍可查看。请检查本机配对、有效期限与授权范围。"
     }
@@ -204,9 +256,9 @@ struct MessagesView: View {
         }
     }
     @ViewBuilder private func recoveryActions(_ item: WorkspaceSubmission) -> some View {
-        if store.available(.conversationGet) { Button("读取对话核实") { Task { await store.inspectSubmission() } }.buttonStyle(.bordered).disabled(store.busy != nil) }
-        if item.retryable { Button("重试同一请求") { Task { await store.send(retry: true) } }.buttonStyle(.bordered).disabled(store.busy != nil || !store.canSend) }
-        else { Button("保留记录并继续") { Task { await store.dismissSubmission() } }.buttonStyle(.bordered).disabled(store.busy != nil) }
+        if store.available(.conversationGet) { Button { Task { await store.inspectSubmission() } } label: { Text("读取对话核实").workspaceTapTarget() }.buttonStyle(.bordered).disabled(store.busy != nil) }
+        if item.retryable { Button { requestSend(retry: true) } label: { Text("重试同一请求").workspaceTapTarget() }.buttonStyle(.bordered).disabled(store.busy != nil || !store.canSend) }
+        else { Button { Task { await store.dismissSubmission() } } label: { Text("保留记录并继续").workspaceTapTarget() }.buttonStyle(.bordered).disabled(store.busy != nil) }
     }
 }
 
@@ -217,22 +269,24 @@ private struct ConversationTurn: Identifiable {
 
 struct TurnView: View {
     @EnvironmentObject private var store: WorkspaceStore
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let turn: RemoteRecord
     let agentName: String
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Spacer(minLength: 30)
+                Spacer(minLength: dynamicTypeSize.isAccessibilitySize ? 0 : 30)
                 VStack(alignment: .trailing, spacing: 7) {
                     Text(turn.string("text")).textSelection(.enabled).padding(16).background(Color.brandPrimary.opacity(0.12), in: RoundedRectangle(cornerRadius: 20))
-                    HStack(spacing: 8) { Text(remoteDate(turn["created_at"])).font(.caption2).foregroundStyle(.secondary); RemoteStatus(status: turn.string("status")) }
+                    WorkspaceAdaptiveStack(spacing: 8) { Text(remoteDate(turn["created_at"])).font(.caption2).foregroundStyle(.secondary); RemoteStatus(status: turn.string("status")) }
                 }
             }
             HStack(alignment: .top, spacing: 10) {
-                AgentAvatar(name: agentName, size: 30)
+                if !dynamicTypeSize.isAccessibilitySize { AgentAvatar(name: agentName, size: 30) }
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(agentName).font(.caption.bold()).foregroundStyle(.secondary)
+                    Text(agentName).font(.caption.bold()).foregroundStyle(.secondary).accessibilityAddTraits(.isHeader)
                     response
+                    if turn.string("status") == "completed" { ContentReportButton(kind: "turn", recordID: turn.string("turn_id")) }
                     if !references.isEmpty {
                         ViewThatFits(in: .horizontal) {
                             HStack { relatedButtons }
@@ -240,11 +294,14 @@ struct TurnView: View {
                         }
                     }
                 }
-                Spacer(minLength: 16)
+                Spacer(minLength: dynamicTypeSize.isAccessibilitySize ? 0 : 16)
             }
         }.accessibilityElement(children: .contain)
     }
     @ViewBuilder private var response: some View {
+        if turn.record("content_review").string("status") == "rejected" {
+            InlineNotice(message: "此回复已根据工作区的举报处理决定移除。", style: .info)
+        } else {
         switch turn.string("status") {
         case "completed":
             ConversationReplyText(text: turn.string("response").isEmpty ? "Agent 已结束本回合，未返回文本内容。" : turn.string("response")).textSelection(.enabled).lineSpacing(5).padding(16).background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 18))
@@ -255,6 +312,7 @@ struct TurnView: View {
             }.foregroundStyle(Color.statusDestructive).padding(16).background(Color.statusDestructive.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
         default:
             Label(turn.string("status") == "running" ? "正在处理这一回合…" : "已受理，等待开始处理…", systemImage: "clock").font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 10)
+        }
         }
     }
     private var references: [ConversationReference] {
@@ -276,7 +334,7 @@ struct TurnView: View {
                 if reference.kind == "conversation" {
                     Task { await store.navigateToConversation(id: reference.subjectID, turnID: reference.turnID.isEmpty ? nil : reference.turnID) }
                 } else { store.collaborationFocusID = reference.subjectID; store.tab = 2 }
-            } label: { Label(reference.title, systemImage: reference.kind == "conversation" ? "bubble.left.and.bubble.right" : reference.kind == "inbox" ? "tray" : "arrow.up.right.square") }
+            } label: { Label(reference.title, systemImage: reference.kind == "conversation" ? "bubble.left.and.bubble.right" : reference.kind == "inbox" ? "tray" : "arrow.up.right.square").workspaceTapTarget() }
                 .font(.caption).buttonStyle(.bordered).disabled(store.busy != nil || store.submission != nil || store.demo)
         }
     }
@@ -309,6 +367,7 @@ private struct ConversationReplyText: View {
 struct ConversationHistoryView: View {
     @EnvironmentObject private var store: WorkspaceStore
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var query = ""
     @State private var remoteID = ""
     @State private var scope = ConversationLibraryScope.active
@@ -321,6 +380,7 @@ struct ConversationHistoryView: View {
     @State private var renaming: SavedConversationItem?
     @State private var title = ""
     @State private var removing: SavedConversationItem?
+    @FocusState private var enteringID: Bool
     private let network = NetworkManager.shared
     private var loadKey: String { (store.selectedAgentID ?? "") + ":" + scope.rawValue + ":" + query + ":" + String(network.sessionRevision) }
     private var changing: Bool { store.busy != nil || store.submission != nil || editingID != nil || store.demo }
@@ -329,9 +389,10 @@ struct ConversationHistoryView: View {
         NavigationStack {
             List {
                 Section {
-                    Picker("对话范围", selection: $scope) {
-                        ForEach(ConversationLibraryScope.allCases) { Text($0.title).tag($0) }
-                    }.pickerStyle(.segmented).disabled(editingID != nil)
+                    Group {
+                        if dynamicTypeSize.isAccessibilitySize { scopePicker.pickerStyle(.menu) }
+                        else { scopePicker.pickerStyle(.segmented) }
+                    }.disabled(editingID != nil)
                 } footer: {
                     Text("搜索账号已保存的标题、消息与回复。归档和移除只改变账户历史视图；移除的对话可在「已移除」中恢复。")
                 }
@@ -345,7 +406,9 @@ struct ConversationHistoryView: View {
                 }
                 Section {
                     TextField("输入完整对话 ID", text: $remoteID).crossPlatformAutocapitalization().autocorrectionDisabled()
+                        .focused($enteringID).submitLabel(.done).onSubmit { enteringID = false }.accessibilityLabel("完整对话 ID")
                     Button("读取已有对话") {
+                        enteringID = false
                         Task {
                             let id = remoteID.trimmingCharacters(in: .whitespacesAndNewlines)
                             await store.openConversation(id)
@@ -355,7 +418,8 @@ struct ConversationHistoryView: View {
                 } header: { Text("找回其他对话") } footer: { Text("用对话 ID 读取尚未同步到账号的历史记录。") }
                 if let libraryError { InlineNotice(message: libraryError, style: .error) }
                 if let error = store.error { InlineNotice(message: error, style: .error) }
-            }.searchable(text: $query, prompt: "搜索标题、消息与回复")
+            }.workspaceScrollDismissesKeyboard()
+                .searchable(text: $query, prompt: "搜索标题、消息与回复")
                 .navigationTitle("历史对话")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() }.disabled(editingID != nil) } }
                 .refreshable { await load(reset: true) }
@@ -378,25 +442,32 @@ struct ConversationHistoryView: View {
             .interactiveDismissDisabled(editingID != nil)
     }
 
+    private var scopePicker: some View {
+        Picker("对话范围", selection: $scope) {
+            ForEach(ConversationLibraryScope.allCases) { Text($0.title).tag($0) }
+        }
+    }
+
     private func historyRow(_ item: SavedConversationItem) -> some View {
         HStack(spacing: 12) {
             Button { Task { await open(item) } } label: {
                 HStack {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
-                            Text(item.title).foregroundStyle(.primary).lineLimit(2)
-                            if item.data.bool("unread") { Circle().fill(Color.brandPrimary).frame(width: 7, height: 7).accessibilityLabel("未读") }
+                            Text(item.title).foregroundStyle(.primary).lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
+                            if item.data.bool("unread") { Circle().fill(Color.brandPrimary).frame(width: 7, height: 7).accessibilityHidden(true) }
                         }
                         if !item.data.record("match").string("excerpt").isEmpty {
-                            Text(item.data.record("match").string("excerpt")).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                            Text(item.data.record("match").string("excerpt")).font(.caption).foregroundStyle(.secondary).lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 3)
                         }
                         Text(Date(timeIntervalSince1970: item.data.number("updatedAt") / 1000), format: .dateTime.month().day().hour().minute()).font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if item.data.bool("pending") { Image(systemName: "clock").foregroundStyle(Color.statusWarning).accessibilityLabel("处理中") }
-                    if store.conversationID == item.id { Image(systemName: "checkmark").foregroundStyle(Color.brandPrimary).accessibilityLabel("当前对话") }
-                }.contentShape(Rectangle())
+                    if item.data.bool("pending") { Image(systemName: "clock").foregroundStyle(Color.statusWarning).accessibilityHidden(true) }
+                    if store.conversationID == item.id { Image(systemName: "checkmark").foregroundStyle(Color.brandPrimary).accessibilityHidden(true) }
+                }.workspaceTapTarget().contentShape(Rectangle())
             }.buttonStyle(.plain).disabled(changing || item.data.bool("deleted"))
+                .accessibilityValue([item.data.bool("unread") ? "未读" : nil, item.data.bool("pending") ? "处理中" : nil, store.conversationID == item.id ? "当前对话" : nil].compactMap { $0 }.joined(separator: "，"))
             Menu {
                 if item.data.bool("deleted") {
                     Button("恢复到历史") { Task { await update(item, patch: ["deleted": false]) } }
@@ -407,7 +478,8 @@ struct ConversationHistoryView: View {
                     Button("移除账户历史", role: .destructive) { removing = item }
                         .disabled(item.data.bool("pending") || !store.uncertainActions.isEmpty)
                 }
-            } label: { Image(systemName: "ellipsis.circle").font(.title3).padding(4).accessibilityLabel("管理「\(item.title)」") }
+            } label: { Image(systemName: "ellipsis.circle").font(.title3).workspaceTapTarget() }
+                .accessibilityLabel("管理「\(item.title)」")
                 .disabled(changing)
         }.padding(.vertical, 6)
     }

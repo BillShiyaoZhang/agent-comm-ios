@@ -10,6 +10,7 @@ struct LoginView: View {
     @State private var showRegister = false
     @State private var helpMode: String?
     @FocusState private var focusedField: Field?
+    @AccessibilityFocusState private var errorHasFocus: Bool
 
     private enum Field { case server, email, password }
 
@@ -34,12 +35,31 @@ struct LoginView: View {
 
                     if let errorMessage {
                         InlineNotice(message: errorMessage, style: .error)
+                            .accessibilityFocused($errorHasFocus)
+                    }
+
+                    if let notice = networkManager.accountNotice {
+                        InlineNotice(message: notice, style: networkManager.localDeletionCleanupNeeded ? .error : .info)
+                        if networkManager.localDeletionCleanupNeeded {
+                            Button {
+                                guard !isLoading else { return }
+                                isLoading = true
+                                Task {
+                                    defer { isLoading = false }
+                                    do { try await networkManager.retryLocalDeletionCleanup(); errorMessage = nil }
+                                    catch { errorMessage = error.localizedDescription }
+                                }
+                            } label: {
+                                Label("清理本机账户数据", systemImage: "trash").workspaceTapTarget()
+                            }.disabled(isLoading)
+                        }
                     }
 
                     WorkspaceCard {
                         VStack(alignment: .leading, spacing: 20) {
                             WorkspaceField(title: "工作区地址", hint: "使用已部署的工作区地址。连接电脑上的服务时，请填写电脑的局域网地址。") {
                                 TextField("https://workspace.example.com", text: $serverUrl)
+                                    .accessibilityLabel("工作区地址")
                                     .crossPlatformKeyboardType(.url)
                                     .crossPlatformAutocapitalization()
                                     .autocorrectionDisabled()
@@ -53,6 +73,7 @@ struct LoginView: View {
 
                             WorkspaceField(title: "邮箱") {
                                 TextField("you@example.com", text: $email)
+                                    .accessibilityLabel("邮箱")
                                     .textContentType(.username)
                                     .crossPlatformKeyboardType(.emailAddress)
                                     .crossPlatformAutocapitalization()
@@ -64,6 +85,7 @@ struct LoginView: View {
                             }
                             WorkspaceField(title: "密码") {
                                 SecureField("输入账户密码", text: $password)
+                                    .accessibilityLabel("密码")
                                     .textContentType(.password)
                                     .workspaceInputStyle()
                                     .focused($focusedField, equals: .password)
@@ -77,7 +99,7 @@ struct LoginView: View {
                                 }
                             }
                             .buttonStyle(WorkspacePrimaryButtonStyle())
-                            .disabled(isLoading)
+                            .disabled(isLoading || email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || password.isEmpty || serverUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
                         .disabled(isLoading)
                     }
@@ -90,11 +112,21 @@ struct LoginView: View {
                     .foregroundStyle(Color.brandPrimary)
                     .disabled(isLoading)
 
-                    HStack {
-                        Button("忘记密码") { openEmailHelp("reset") }
-                        Spacer()
-                        Button("重新发送验证邮件") { openEmailHelp("verify") }
+                    WorkspaceAdaptiveStack {
+                        Button { openEmailHelp("reset") } label: {
+                            Text("忘记密码").workspaceTapTarget()
+                        }
+                        Button { openEmailHelp("verify") } label: {
+                            Text("重新发送验证邮件").workspaceTapTarget()
+                        }
                     }.font(.subheadline).disabled(isLoading)
+
+                    NavigationLink {
+                        WorkspaceDataView()
+                    } label: {
+                        Label("数据与隐私", systemImage: "hand.raised").workspaceTapTarget()
+                    }
+                    .font(.subheadline)
 
                     Label("账户属于当前工作区，切换地址后需要重新登录。", systemImage: "lock.shield")
                         .font(.footnote)
@@ -106,6 +138,7 @@ struct LoginView: View {
                 .frame(maxWidth: .infinity)
             }
             .background(Color.listBackground)
+            .workspaceScrollDismissesKeyboard()
             .navigationTitle("Agent Workspace")
             .crossPlatformNavigationBarTitleDisplayModeInline()
             .navigationDestination(isPresented: $showRegister) {
@@ -117,11 +150,21 @@ struct LoginView: View {
         .onAppear {
             if serverUrl.isEmpty { serverUrl = networkManager.baseUrl }
         }
+        .onChange(of: errorMessage) { _, message in errorHasFocus = message != nil }
+        .onDisappear { password = "" }
     }
 
     private func openEmailHelp(_ mode: String) {
-        do { try networkManager.configureServer(serverUrl); serverUrl = networkManager.baseUrl; helpMode = mode }
-        catch { errorMessage = error.localizedDescription }
+        do {
+            try networkManager.configureServer(serverUrl)
+            serverUrl = networkManager.baseUrl
+            focusedField = nil
+            errorMessage = nil
+            helpMode = mode
+        } catch {
+            errorMessage = error.localizedDescription
+            focusedField = .server
+        }
     }
 
     private func openRegistration() {
@@ -155,10 +198,11 @@ struct LoginView: View {
         focusedField = nil
         errorMessage = nil
         isLoading = true
+        let submittedPassword = password
         Task {
             defer { isLoading = false }
             do {
-                try await networkManager.login(email: normalizedEmail, password: password)
+                try await networkManager.login(email: normalizedEmail, password: submittedPassword)
                 password = ""
             } catch {
                 errorMessage = error.localizedDescription

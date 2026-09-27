@@ -12,13 +12,19 @@ public enum RPCMethod: String, Codable, CaseIterable, Sendable, Hashable {
     case approvalRespond = "approval.respond"
     case contactsRequests = "contacts.requests"
     case contactsRespond = "contacts.respond"
+    case contactsBlock = "contacts.block"
+    case contactsUnblock = "contacts.unblock"
     case messagesSend = "messages.send"
     case inboxMarkRead = "inbox.mark_read"
+    case inboxReviewPreview = "inbox.review_preview"
+    case inboxReview = "inbox.review"
     case collaborationExecute = "collaboration.execute"
 
     public var isWrite: Bool {
-        [.conversationSend, .contactsAdd, .approvalRespond, .contactsRespond, .messagesSend, .inboxMarkRead, .collaborationExecute].contains(self)
+        [.conversationSend, .contactsAdd, .approvalRespond, .contactsRespond, .contactsBlock, .contactsUnblock, .messagesSend, .inboxMarkRead, .inboxReview, .collaborationExecute].contains(self)
     }
+    /// Safety controls and read acknowledgements send identifiers, not new AI content.
+    public var requiresContentSharing: Bool { isWrite && ![.contactsBlock, .contactsUnblock, .inboxMarkRead, .inboxReview].contains(self) }
 }
 
 public struct PendingCall: Codable, Sendable, Hashable {
@@ -126,10 +132,12 @@ public struct WorkspaceAgent: Codable, Sendable, Hashable {
     public var operations: [WorkspaceOperation]?
     public var recordStates: [WorkspaceRecordState]?
     public var activeConversationState: WorkspaceConversationState?
+    public var contentSafety: RemoteRecord?
     public init(agent: WorkspaceConnection, identity: WorkspaceIdentity = .init(), sync: WorkspaceSync = .init(), snapshots: [String: WorkspaceSnapshot] = [:], conversations: [WorkspaceConversation] = [], activeConversationId: String = "", conversation: RemoteRecord? = nil, hasEarlierTurns: Bool = false, submission: WorkspaceSubmission? = nil,
-                operations: [WorkspaceOperation]? = nil, recordStates: [WorkspaceRecordState]? = nil, activeConversationState: WorkspaceConversationState? = nil) {
+                operations: [WorkspaceOperation]? = nil, recordStates: [WorkspaceRecordState]? = nil, activeConversationState: WorkspaceConversationState? = nil, contentSafety: RemoteRecord? = nil) {
         self.agent = agent; self.identity = identity; self.sync = sync; self.snapshots = snapshots; self.conversations = conversations; self.activeConversationId = activeConversationId; self.conversation = conversation; self.hasEarlierTurns = hasEarlierTurns; self.submission = submission
         self.operations = operations; self.recordStates = recordStates; self.activeConversationState = activeConversationState
+        self.contentSafety = contentSafety
     }
 }
 
@@ -144,7 +152,14 @@ public struct WorkspaceOverview: Codable, Sendable, Hashable {
 /// Delayed snapshots cannot overwrite a newer saved result.
 public func mergeSnapshots(previous: [String: WorkspaceSnapshot], incoming: [String: WorkspaceSnapshot]) -> [String: WorkspaceSnapshot] {
     var merged = previous
-    for (key, snapshot) in incoming where snapshot.time >= (merged[key]?.time ?? -.infinity) { merged[key] = snapshot }
+    for (key, snapshot) in incoming {
+        if ["contacts.list", "collaboration.state"].contains(key), let oldRevision = merged[key]?.data["safety_revision"]?.numberValue {
+            guard let newRevision = snapshot.data["safety_revision"]?.numberValue, newRevision >= oldRevision else { continue }
+            if newRevision > oldRevision { merged[key] = snapshot; continue }
+        }
+        guard snapshot.time >= (merged[key]?.time ?? -.infinity) else { continue }
+        merged[key] = snapshot
+    }
     return merged
 }
 
@@ -155,8 +170,11 @@ public func mergeTurns(earlier: [RemoteRecord], latest: [RemoteRecord]) -> [Remo
         let id = turn.string("turn_id")
         guard !id.isEmpty else { continue }
         if let saved = byId[id] {
+            // An operator removal must replace cached content even if the
+            // source turn is pending. A stale unfiltered page cannot restore it.
+            if saved.record("content_review").string("status") == "rejected" && turn.record("content_review").string("status") != "rejected" { continue }
             let terminal = ["completed", "failed"].contains(saved.string("status")) || saved.string("status") == "interrupted" && !saved.bool("locally_unconfirmed")
-            if terminal && ["submitted", "running"].contains(turn.string("status")) { continue }
+            if turn.record("content_review").string("status") != "rejected" && terminal && ["submitted", "running"].contains(turn.string("status")) { continue }
         }
         byId[id] = turn
     }

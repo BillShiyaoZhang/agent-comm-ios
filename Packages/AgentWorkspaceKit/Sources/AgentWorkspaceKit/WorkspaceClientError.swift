@@ -35,3 +35,15 @@ public struct ControlCallError: Error, LocalizedError, Sendable {
         self.message = message; self.call = call; self.retryable = retryable; self.uncertain = uncertain; self.httpStatus = httpStatus
     }
 }
+
+/// A lost or malformed deletion response is never proof that the account was deleted or kept.
+public struct AccountDeletionError: Error, LocalizedError, Sendable {
+    public let message: String
+    public let uncertain: Bool
+    public let httpStatus: Int?
+    public var errorDescription: String? { message }
+
+    public init(_ message: String, uncertain: Bool, httpStatus: Int? = nil) {
+        self.message = message; self.uncertain = uncertain; self.httpStatus = httpStatus
+    }
+}

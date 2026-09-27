@@ -12,6 +12,10 @@ struct SocialConfirmation: Identifiable {
     var approval: RemoteRecord? = nil
     var original: WorkspaceOperation? = nil
     var onSucceeded: (() -> Void)? = nil
+
+    var isDestructive: Bool {
+        method == .contactsBlock || (method == .collaborationExecute && ["revoke", "revoke_worker", "revoke_collaboration_maintenance"].contains(params.string("action")))
+    }
 }
 
 struct SocialConfirmationSheet: View {
@@ -20,6 +24,9 @@ struct SocialConfirmationSheet: View {
     let action: SocialConfirmation
     @State private var checked = false
     @State private var submitting = false
+    @State private var submissionMessage: String?
+    @State private var requiresVerification = false
+    @AccessibilityFocusState private var feedbackFocused: Bool
 
     var body: some View {
         NavigationStack {
@@ -31,42 +38,87 @@ struct SocialConfirmationSheet: View {
                     if let approval = action.approval, !socialDate(approval["expires_at"]).isEmpty {
                         Text("确认展示有效至：" + socialDate(approval["expires_at"])).font(.caption).foregroundStyle(.secondary)
                     }
+                    if action.method.requiresContentSharing, let context = store.sharingContext {
+                        AgentSharingDisclosure(context: context)
+                        AgentSharingConsentControl(context: context).disabled(submitting)
+                    }
                     Toggle("我已核对以上完整内容与接收方", isOn: $checked).font(.subheadline)
                     if action.agentID != store.selectedAgentID { InlineNotice(message: "当前 Agent 已切换，请关闭并重新核对。", style: .error) }
-                    Button {
-                        guard !submitting, checked, action.agentID == store.selectedAgentID else { return }
-                        submitting = true
-                        Task {
-                            if let original = action.original { await store.retryAction(original) }
-                            else if let approval = action.approval { await store.confirmApproval(approval, decision: action.params.string("decision")) }
-                            else { await store.performAction(action.method, params: action.params) }
-                            if store.actionOperations.contains(where: { $0.phase == "succeeded" && $0.call.method == action.method && $0.call.params == action.params }) { action.onSucceeded?() }
-                            submitting = false
-                            dismiss()
-                        }
-                    } label: {
-                        HStack { if submitting { ProgressView().tint(.white) }; Text(submitting ? "正在提交…" : action.title) }.frame(maxWidth: .infinity)
-                    }.buttonStyle(WorkspacePrimaryButtonStyle())
-                        .disabled(!checked || submitting || action.agentID != store.selectedAgentID || !(action.original != nil ? store.canAct(action.method) : socialCanSubmit(store, action.method)))
+                    if let submissionMessage {
+                        InlineNotice(message: submissionMessage, style: requiresVerification ? .info : .error)
+                            .accessibilityFocused($feedbackFocused)
+                        if requiresVerification { Text("关闭后，在协作页刷新并核实原请求，避免重复提交。").font(.subheadline).foregroundStyle(.secondary) }
+                    }
+                    submissionButton
+                        .disabled(!checked || (action.method.requiresContentSharing && !store.hasAgentSharingPermission) || submitting || requiresVerification || action.agentID != store.selectedAgentID || !(action.original != nil ? store.canAct(action.method) : socialCanSubmit(store, action.method)))
                 }.padding(20)
             }.background(Color.listBackground).navigationTitle(action.title)
                 .crossPlatformNavigationBarTitleDisplayModeInline()
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() }.disabled(submitting) } }
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button { dismiss() } label: { Text(submissionMessage == nil ? "取消" : "关闭").workspaceTapTarget() }.disabled(submitting) } }
         }.interactiveDismissDisabled(submitting)
+            .onChange(of: store.sharingContext) { _, _ in checked = false }
+    }
+
+    @ViewBuilder private var submissionButton: some View {
+        if action.isDestructive {
+            Button(role: .destructive, action: submit) { submissionLabel }.buttonStyle(.bordered)
+        } else {
+            Button(action: submit) { submissionLabel }.buttonStyle(WorkspacePrimaryButtonStyle())
+        }
+    }
+    private var submissionLabel: some View {
+        HStack {
+            if submitting { ProgressView().accessibilityHidden(true) }
+            Text(submitting ? "正在提交…" : action.title)
+        }.frame(maxWidth: .infinity).workspaceTapTarget()
+    }
+    private func submit() {
+        guard !submitting, checked, !action.method.requiresContentSharing || store.hasAgentSharingPermission, !requiresVerification, action.agentID == store.selectedAgentID else { return }
+        let existingIDs = Set(store.actionOperations.map { $0.call.requestId })
+        submitting = true
+        submissionMessage = nil
+        store.actionResult = nil
+        store.error = nil
+        Task {
+            if let original = action.original { await store.retryAction(original) }
+            else if let approval = action.approval { await store.confirmApproval(approval, decision: action.params.string("decision")) }
+            else { await store.performAction(action.method, params: action.params) }
+            submitting = false
+            guard action.agentID == store.selectedAgentID else { return }
+            let operation = store.actionOperations.first { operation in
+                guard operation.call.method == action.method, operation.call.params == action.params else { return false }
+                if let original = action.original { return operation.call.requestId == original.call.requestId }
+                return !existingIDs.contains(operation.call.requestId)
+            }
+            if operation?.phase == "succeeded" {
+                action.onSucceeded?()
+                dismiss()
+            } else {
+                requiresVerification = operation.map { ["sending", "uncertain"].contains($0.phase) } ?? (store.actionResult != nil)
+                submissionMessage = store.error ?? store.actionResult ?? "操作未提交。请检查连接与当前权限后重新核对。"
+                checked = false
+                feedbackFocused = true
+            }
+        }
     }
 }
 
 struct SocialActionFeedback: View {
     @EnvironmentObject private var store: WorkspaceStore
     @State private var confirmation: SocialConfirmation?
+    @State private var sharingDisclosure: AgentSharingContext?
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if let result = store.actionResult { InlineNotice(message: result) }
+            if let context = store.sharingContext {
+                Button { sharingDisclosure = context } label: { Label("管理共享授权", systemImage: "hand.raised").workspaceTapTarget() }
+                    .font(.caption).accessibilityValue(store.hasAgentSharingPermission ? "已允许，可撤回" : "尚未允许")
+            }
+            if let result = store.actionResult { InlineNotice(message: result, style: resultStyle) }
             if let response = store.actionResponse, !response.isEmpty {
-                DisclosureGroup("最近操作的 Agent 返回结果") { SnapshotDetails(data: response).padding(.top, 8) }.font(.caption)
+                DisclosureGroup { SnapshotDetails(data: response).padding(.top, 8) } label: { Text("最近操作的 Agent 返回结果").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }.font(.caption)
             }
             if !store.uncertainActions.isEmpty {
-                DisclosureGroup("\(store.uncertainActions.count) 项提交结果待核实") {
+                DisclosureGroup {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("原请求已保留。先刷新或在本机核实结果，避免创建重复动作。").font(.caption).foregroundStyle(.secondary)
                         ForEach(store.uncertainActions, id: \.call.requestId) { action in
@@ -75,17 +127,25 @@ struct SocialActionFeedback: View {
                                 Text(action.call.method.rawValue + " · " + action.call.requestId).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
                                 SnapshotDetails(data: action.call.params)
                                 if action.retryable {
-                                    Button("继续提交原请求") {
+                                    Button {
                                         confirmation = SocialConfirmation(agentID: store.selectedAgentID, method: action.call.method, params: action.call.params, title: "确认继续提交原请求", detail: socialPretty(action.call.params), explanation: "沿用原请求 ID：\(action.call.requestId)。继续本次提交，不会创建新操作。请先核对已同步状态与以下完整内容。", original: action)
-                                    }.font(.caption).buttonStyle(.bordered).disabled(!store.canAct(action.call.method))
+                                    } label: { Text("继续提交原请求").workspaceTapTarget() }.font(.caption).buttonStyle(.bordered).disabled(!store.canAct(action.call.method))
                                 }
                             }.padding(12).background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 12))
                         }
-                        Button("刷新核实结果") { Task { await store.refresh(schedule: true) } }.buttonStyle(.bordered).disabled(store.busy != nil || store.demo)
+                        Button { Task { await store.refresh(schedule: true) } } label: { Text("刷新核实结果").workspaceTapTarget() }.buttonStyle(.bordered).disabled(store.busy != nil || store.demo)
                     }.padding(.top, 8)
-                }.font(.subheadline).foregroundStyle(Color.statusWarning)
+                } label: { Text("\(store.uncertainActions.count) 项提交结果待核实").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }.font(.subheadline).foregroundStyle(Color.statusWarning)
             }
         }.sheet(item: $confirmation) { SocialConfirmationSheet(action: $0) }
+            .sheet(item: $sharingDisclosure) { AgentSharingPermissionView(context: $0) }
+    }
+    private var resultStyle: InlineNotice.NoticeStyle {
+        switch store.actionOperations.first(where: { $0.message == store.actionResult })?.phase {
+        case "succeeded": return .success
+        case "failed": return .error
+        default: return .info
+        }
     }
 }
 
@@ -99,7 +159,7 @@ struct AddContactForm: View {
 
     var body: some View {
         WorkspaceCard {
-            DisclosureGroup("添加联系人") {
+            DisclosureGroup {
                 VStack(alignment: .leading, spacing: 14) {
                     Text("本机 Agent 会排队并尝试投递好友请求。对方收到并接受后，双方才建立通讯录连接。").font(.caption).foregroundStyle(.secondary)
                     WorkspaceField(title: "姓名或称呼") { TextField("例如：小王", text: $name).workspaceInputStyle() }
@@ -108,10 +168,10 @@ struct AddContactForm: View {
                         TextField("urn:agent-comm:agent:…", text: $urn).crossPlatformAutocapitalization().autocorrectionDisabled().workspaceInputStyle()
                     }
                     if let error { InlineNotice(message: error, style: .error) }
-                    Button("核对并添加联系人") { prepare() }.buttonStyle(.borderedProminent).disabled(!store.canAct(.contactsAdd) || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || urn.isEmpty)
+                    Button { prepare() } label: { Text("核对并添加联系人").workspaceTapTarget() }.buttonStyle(.borderedProminent).disabled(!store.canAct(.contactsAdd) || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || urn.isEmpty)
                     SocialCapabilityHint(method: .contactsAdd)
                 }.padding(.top, 12)
-            }
+            } label: { Text("添加联系人").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }
         }.sheet(item: $confirmation) { SocialConfirmationSheet(action: $0) }
     }
     private func prepare() {
@@ -140,9 +200,9 @@ struct ContactRequestsView: View {
                     Text("好友请求").font(.headline)
                     Text("接受后开通普通消息；协作仍需单独授权。").font(.caption).foregroundStyle(.secondary)
                     let pending = store.contactRequests.filter { $0.string("status") == "pending" }
-                    ForEach(Array(pending.reversed().enumerated()), id: \.offset) { _, request in ContactRequestCard(request: request).id(request.string("request_id")) }
+                    ForEach(socialRecordRows(Array(pending.reversed()), key: "request_id")) { item in ContactRequestCard(request: item.data).id(item.data.string("request_id")) }
                     let history = store.contactRequests.filter { $0.string("status") != "pending" }
-                    if !history.isEmpty { DisclosureGroup("已处理的请求 · \(history.count)", isExpanded: $historyOpen) { ForEach(Array(history.reversed().enumerated()), id: \.offset) { _, request in ContactRequestCard(request: request).id(request.string("request_id")) } } }
+                    if !history.isEmpty { DisclosureGroup(isExpanded: $historyOpen) { ForEach(socialRecordRows(Array(history.reversed()), key: "request_id")) { item in ContactRequestCard(request: item.data).id(item.data.string("request_id")) } } label: { Text("已处理的请求 · \(history.count)").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() } }
                 }
             }.task(id: store.collaborationFocusID) { if let id = store.collaborationFocusID, store.contactRequests.contains(where: { $0.string("request_id") == id && $0.string("status") != "pending" }) { historyOpen = true } }
         }
@@ -155,13 +215,15 @@ struct ContactRequestCard: View {
     @State private var confirmation: SocialConfirmation?
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack { Text(request.string("direction") == "incoming" ? "收到的请求" : "发起的请求").font(.caption); Spacer(); Text(requestStatus).font(.caption).foregroundStyle(.secondary) }
+            WorkspaceAdaptiveStack { Text(request.string("direction") == "incoming" ? "收到的请求" : "发起的请求").font(.caption); Text(requestStatus).font(.caption).foregroundStyle(.secondary) }.accessibilityElement(children: .combine)
             Text(request.string("peer_urn")).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            PeerSafetyControls(urn: request.string("peer_urn"))
+            ContentReportButton(kind: "contact_request", recordID: request.string("request_id"))
             Text(socialDate(request["updated_at"] ?? request["created_at"])).font(.caption2).foregroundStyle(.secondary)
             if request.string("direction") == "incoming" && request.string("status") == "pending" {
-                HStack {
-                    Button("接受好友请求") { prepare("accept") }.buttonStyle(.borderedProminent)
-                    Button("拒绝") { prepare("reject") }.buttonStyle(.bordered)
+                WorkspaceAdaptiveStack {
+                    Button { prepare("accept") } label: { Text("接受好友请求").workspaceTapTarget() }.buttonStyle(.borderedProminent)
+                    Button { prepare("reject") } label: { Text("拒绝").workspaceTapTarget() }.buttonStyle(.bordered)
                 }.disabled(!store.canAct(.contactsRespond) || request.string("request_id").isEmpty || socialLocked(store, .contactsRespond, "request_id", request.string("request_id")))
             }
         }.padding(12).background(Color.listBackground, in: RoundedRectangle(cornerRadius: 12))
@@ -184,9 +246,9 @@ struct ContactCard: View {
     var body: some View {
         WorkspaceCard {
             VStack(alignment: .leading, spacing: 12) {
-                HStack { AgentAvatar(name: socialContactName(contact), size: 38); Text(socialContactName(contact)).font(.headline); Spacer() }
+                HStack { AgentAvatar(name: socialContactName(contact), size: 38).accessibilityHidden(true); Text(socialContactName(contact)).font(.headline); Spacer() }
                 Text(connectionLabel).font(.caption).foregroundStyle(.secondary)
-                if contact.string("connection_status") == "connected" {
+                if contact.string("connection_status") == "connected" && !store.peerIsBlocked(contact.string("urn")) {
                     TimelineView(.periodic(from: .now, by: 30)) { timeline in
                         let presence = presenceLabel(at: timeline.date)
                         Label(presence.0, systemImage: "circle.fill").font(.caption).foregroundStyle(presence.1 ? Color.statusSuccess : Color.secondary)
@@ -195,21 +257,24 @@ struct ContactCard: View {
                 if contact.strings("aliases").count > 1 { Text(contact.strings("aliases").dropFirst().joined(separator: " · ")).font(.caption).foregroundStyle(.secondary) }
                 Text(contact.string("urn")).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
                 if !contact.string("urn").isEmpty { CopyLabel(value: contact.string("urn"), title: "复制 URN") }
+                PeerSafetyControls(urn: contact.string("urn"))
+                ContentReportButton(kind: "contact", recordID: contact.string("contact_id"))
                 if contact.string("connection_status") == "rejected" {
                     Text("上次好友请求已被拒绝。重新发起会沿用本机联系人记录，并由 Agent 核对当前状态。").font(.caption).foregroundStyle(.secondary)
-                    Button("重新发起好友请求") {
+                    Button {
                         let aliases = contact.strings("aliases").isEmpty ? [socialContactName(contact)] : contact.strings("aliases")
                         confirmation = SocialConfirmation(agentID: store.selectedAgentID, method: .contactsAdd, params: ["contact_id": .string(contact.string("contact_id")), "urn": .string(contact.string("urn")), "aliases": .array(aliases.map(JSONValue.string))], title: "确认重新发起", detail: "通讯录称呼：\(aliases.joined(separator: "、"))\n\n对方 URN：\n\(contact.string("urn"))", explanation: "仅当仍无在途请求且尚未连接，Agent 才会生成独立的新请求。旧请求仍保留已拒绝状态。")
-                    }.buttonStyle(.bordered).disabled(!store.canAct(.contactsAdd) || contact.string("contact_id").isEmpty || !socialValidUrn(contact.string("urn")))
+                    } label: { Text("重新发起好友请求").workspaceTapTarget() }.buttonStyle(.bordered).disabled(!store.canAct(.contactsAdd) || contact.string("contact_id").isEmpty || !socialValidUrn(contact.string("urn")))
                 }
-                if contact.string("connection_status") == "connected" { PeerMessageForm(recipientUrn: contact.string("urn"), compact: true) }
+                if contact.string("connection_status") == "connected" && !store.peerIsBlocked(contact.string("urn")) { PeerMessageForm(recipientUrn: contact.string("urn"), compact: true) }
                 PeerCommunicationView(recipientUrn: contact.string("urn"))
                 SocialRecordAction(kind: "contact", recordID: contact.string("contact_id"), title: socialContactName(contact))
             }
         }.sheet(item: $confirmation) { SocialConfirmationSheet(action: $0) }
     }
     private var connectionLabel: String {
-        switch contact.string("connection_status") { case "connected": return "已建立通讯录连接"; case "pending", "requested": return "请求待投递或待对方处理"; case "rejected": return "好友请求已拒绝"; default: return "尚未建立通讯录连接" }
+        if store.peerIsBlocked(contact.string("urn")) { return "已在这个 Agent 屏蔽" }
+        switch contact.string("connection_status") { case "blocked": return "已在这个 Agent 屏蔽"; case "connected": return "已建立通讯录连接"; case "pending", "requested": return "请求待投递或待对方处理"; case "rejected": return "好友请求已拒绝"; default: return "尚未建立通讯录连接" }
     }
     private func presenceLabel(at now: Date) -> (String, Bool) {
         let presence = contact.record("presence")
@@ -227,6 +292,7 @@ struct PeerMessageForm: View {
     @State private var text = ""
     @State private var error: String?
     @State private var confirmation: SocialConfirmation?
+    @ScaledMetric(relativeTo: .body) private var editorHeight = 110.0
     private var cleanRecipient: String { (recipientUrn.isEmpty ? recipient : recipientUrn).trimmingCharacters(in: .whitespacesAndNewlines) }
     private var contacts: [RemoteRecord] { store.contacts.filter { $0.string("connection_status") == "connected" && $0.string("contact_id") != "self" && !$0.string("urn").isEmpty } }
 
@@ -237,24 +303,25 @@ struct PeerMessageForm: View {
         }.sheet(item: $confirmation) { SocialConfirmationSheet(action: $0) }
     }
     private var form: some View {
-        DisclosureGroup(compact ? "发送消息 / 回复" : "给好友发消息") {
+        DisclosureGroup {
             VStack(alignment: .leading, spacing: 12) {
                 if recipientUrn.isEmpty {
                     Picker("选择联系人", selection: $recipient) {
                         Text("选择已连接的联系人").tag("")
-                        ForEach(contacts, id: \.self) { contact in Text(socialContactName(contact)).tag(contact.string("urn")) }
-                    }.pickerStyle(.menu)
-                    DisclosureGroup("填写确切接收方 URN") { TextField("好友的完整 URN", text: $recipient).crossPlatformAutocapitalization().autocorrectionDisabled().workspaceInputStyle() }.font(.caption)
+                        ForEach(socialRecordRows(contacts, key: "contact_id", fallbackKeys: ["urn"])) { item in Text(socialContactName(item.data)).tag(item.data.string("urn")) }
+                    }.pickerStyle(.menu).workspaceTapTarget()
+                    if contacts.isEmpty { Text("还没有已连接的联系人。请先在「联系人」中添加并等待对方接受。").font(.subheadline).foregroundStyle(.secondary) }
+                    DisclosureGroup { TextField("好友的完整 URN", text: $recipient).crossPlatformAutocapitalization().autocorrectionDisabled().workspaceInputStyle() } label: { Text("填写确切接收方 URN").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }.font(.caption)
                 }
                 if !cleanRecipient.isEmpty { Text("由本机 Agent 发给：\n" + cleanRecipient).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
-                TextEditor(text: $text).frame(minHeight: 110).padding(8).background(Color.listBackground, in: RoundedRectangle(cornerRadius: 12)).accessibilityLabel("发送给好友的消息")
+                TextEditor(text: $text).frame(minHeight: editorHeight).padding(8).background(Color.listBackground, in: RoundedRectangle(cornerRadius: 12)).accessibilityLabel("发送给好友的消息")
                 Text("消息最多 24 KB；本机受理、实际投递和对方已读分别核验。").font(.caption).foregroundStyle(.secondary)
                 if let error { InlineNotice(message: error, style: .error) }
-                Button("核对并发送消息") { prepare() }.buttonStyle(.borderedProminent)
+                Button { prepare() } label: { Text("核对并发送消息").workspaceTapTarget() }.buttonStyle(.borderedProminent)
                     .disabled(!store.canAct(.messagesSend) || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || cleanRecipient.isEmpty || socialLocked(store, .messagesSend, "recipient_urn", cleanRecipient))
                 SocialCapabilityHint(method: .messagesSend)
             }.padding(.top, 10)
-        }
+        } label: { Text(compact ? "发送消息 / 回复" : "给好友发消息").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }
     }
     private func prepare() {
         error = nil
@@ -274,18 +341,25 @@ struct InboxMessageCard: View {
         WorkspaceCard {
             VStack(alignment: .leading, spacing: 12) {
                 Label(message.string("sender_urn", default: "对端 Agent"), systemImage: "arrow.down.left").font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
-                Text(socialMessageText(message.string("text"))).textSelection(.enabled).lineSpacing(4)
+                PeerSafetyControls(urn: message.string("sender_urn"))
+                ContentReportButton(kind: "inbox", recordID: message.string("message_id"))
+                if store.peerIsBlocked(message.string("sender_urn")) { Label("此发送方已被屏蔽，正文保持隐藏", systemImage: "hand.raised").font(.caption) }
+                else if peerContentApproved(message), store.contentSafetyAvailable || store.demo {
+                    Text(socialMessageText(message.string("text"))).textSelection(.enabled).lineSpacing(4)
+                } else { PendingContentReview(messageID: message.string("message_id"), status: message.record("content_review").string("status", default: "pending")) }
                 Text(socialDate(message["received_at"])).font(.caption).foregroundStyle(.secondary)
                 if message.bool("unknown_sender") { Text("这位发送者尚未建立好友连接。").font(.caption).foregroundStyle(Color.statusWarning) }
-                MessageReadButton(message: message)
-                if !message.bool("unknown_sender") && !message.string("sender_urn").isEmpty { PeerMessageForm(recipientUrn: message.string("sender_urn"), compact: true) }
+                if peerContentApproved(message), !store.peerIsBlocked(message.string("sender_urn")), store.contentSafetyAvailable || store.demo {
+                    MessageReadButton(message: message)
+                    if !message.bool("unknown_sender") && !message.string("sender_urn").isEmpty { PeerMessageForm(recipientUrn: message.string("sender_urn"), compact: true) }
+                }
                 if !message.string("task_id").isEmpty { Text("事项 · " + message.string("task_id")).font(.caption).foregroundStyle(.secondary) }
-                DisclosureGroup("来源与确切标识") {
+                DisclosureGroup {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(message.string("message_id")).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                         RelatedConversationLink(source: message.record("source_context"))
                     }.padding(.top, 8)
-                }.font(.caption)
+                } label: { Text("来源与确切标识").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }.font(.caption)
             }
         }
     }
@@ -299,9 +373,9 @@ struct MessageReadButton: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(message.bool("read") ? "已读 · Agent 已记录" : "未读").font(.caption).foregroundStyle(.secondary)
             if !message.bool("read") {
-                Button("标为已读并关闭提醒") {
+                Button {
                     confirmation = SocialConfirmation(agentID: store.selectedAgentID, method: .inboxMarkRead, params: ["message_id": .string(message.string("message_id"))], title: "确认标为已读", detail: "消息来源：\n\(message.string("sender_urn"))\n\n消息全文：\n\(socialMessageText(message.string("text")))", explanation: "将此消息的已读状态同步到本机 Agent，并关闭对应提醒。这不会批准消息中的请求。")
-                }.font(.caption).buttonStyle(.bordered).disabled(!store.canAct(.inboxMarkRead) || message.string("message_id").isEmpty || socialLocked(store, .inboxMarkRead, "message_id", message.string("message_id")))
+                } label: { Text("标为已读并关闭提醒").workspaceTapTarget() }.font(.caption).buttonStyle(.bordered).disabled(!store.canAct(.inboxMarkRead) || message.string("message_id").isEmpty || socialLocked(store, .inboxMarkRead, "message_id", message.string("message_id")))
             }
         }.sheet(item: $confirmation) { SocialConfirmationSheet(action: $0) }
     }
@@ -312,9 +386,10 @@ struct SentMessagesView: View {
     var body: some View {
         if !store.sentMessages.isEmpty {
             WorkspaceCard {
-                DisclosureGroup("已发送消息 · \(store.sentMessages.count)") {
+                DisclosureGroup {
                     VStack(alignment: .leading, spacing: 12) {
-                        ForEach(Array(store.sentMessages.reversed().enumerated()), id: \.offset) { _, message in
+                        ForEach(socialRecordRows(Array(store.sentMessages.reversed()), key: "message_id")) { item in
+                            let message = item.data
                             VStack(alignment: .leading, spacing: 8) {
                                 Text("发给 " + message.string("recipient_urn")).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                                 Text(message.string("text")).font(.subheadline).textSelection(.enabled)
@@ -323,7 +398,7 @@ struct SentMessagesView: View {
                             }.padding(12).background(Color.listBackground, in: RoundedRectangle(cornerRadius: 12))
                         }
                     }.padding(.top, 10)
-                }
+                } label: { Text("已发送消息 · \(store.sentMessages.count)").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }
             }
         }
     }
@@ -339,22 +414,25 @@ struct PeerCommunicationView: View {
     }
     var body: some View {
         if !recipientUrn.isEmpty && !messages.isEmpty {
-            DisclosureGroup("通信记录 · \(messages.count) 条") {
+            DisclosureGroup {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("打开记录不会自动写入 Agent 已读，也不会授权。覆盖本账户已保存的普通通信。").font(.caption).foregroundStyle(.secondary)
-                    ForEach(Array(messages.enumerated()), id: \.offset) { _, message in
+                    ForEach(socialRecordRows(messages, key: "message_id", namespaceKey: "direction")) { item in
+                        let message = item.data
                         VStack(alignment: .leading, spacing: 8) {
                             let incoming = message.string("direction") == "incoming"
                             Text(incoming ? "对端 Agent 来信 · 对端声明" : "本方 Agent 发送记录").font(.caption).foregroundStyle(.secondary)
-                            Text(socialMessageText(message.string("text"))).font(.subheadline).textSelection(.enabled)
+                            if !incoming || (peerContentApproved(message) && store.contentSafetyAvailable && !store.peerIsBlocked(recipientUrn)) {
+                                Text(socialMessageText(message.string("text"))).font(.subheadline).textSelection(.enabled)
+                            } else { PendingContentReview(messageID: message.string("message_id"), status: message.record("content_review").string("status", default: "pending")) }
                             Text(socialDate(message["received_at"] ?? message["created_at"])).font(.caption2).foregroundStyle(.secondary)
-                            if incoming { MessageReadButton(message: message) }
+                            if incoming && peerContentApproved(message) && store.contentSafetyAvailable && !store.peerIsBlocked(recipientUrn) { MessageReadButton(message: message) }
                             else { Text(socialSentStatus(message.string("status"))).font(.caption).foregroundStyle(.secondary) }
                             Text(message.string("message_id")).font(.system(.caption2, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
                         }.padding(12).background(Color.listBackground, in: RoundedRectangle(cornerRadius: 12))
                     }
                 }.padding(.top, 10)
-            }.font(.caption)
+            } label: { Text("通信记录 · \(messages.count) 条").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }.font(.caption)
         }
     }
 }
@@ -365,15 +443,15 @@ struct ApprovalRequestCard: View {
     @State private var confirmation: SocialConfirmation?
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top) { Text(approval.string("subject_id", default: "待确认请求")).font(.subheadline.bold()); Spacer(); RemoteStatus(status: approval.string("status")) }
+            WorkspaceAdaptiveStack { Text(approval.string("subject_id", default: "待确认请求")).font(.subheadline.bold()); RemoteStatus(status: approval.string("status")) }
             Text(approval.string("question", default: "本次同步缺少请求内容，请刷新后再回应。")).font(.subheadline).textSelection(.enabled).lineSpacing(4)
             if !socialDate(approval["expires_at"]).isEmpty { Text("确认展示有效至：" + socialDate(approval["expires_at"])).font(.caption).foregroundStyle(.secondary) }
             if approval.string("status") == "expired" || (socialRemoteDate(approval["expires_at"]).map { $0 <= Date() } ?? false) {
                 Text("上次确认展示已过期，请重新核对全文。Agent 会检查事项是否仍有效。").font(.caption).foregroundStyle(Color.statusWarning)
             }
-            HStack {
-                Button("同意本次请求") { prepare("approve") }.buttonStyle(.borderedProminent)
-                Button("拒绝本次请求") { prepare("deny") }.buttonStyle(.bordered)
+            WorkspaceAdaptiveStack {
+                Button { prepare("approve") } label: { Text("同意本次请求").workspaceTapTarget() }.buttonStyle(.borderedProminent)
+                Button { prepare("deny") } label: { Text("拒绝本次请求").workspaceTapTarget() }.buttonStyle(.bordered)
             }.disabled(!canDecide || socialLocked(store, .approvalRespond, "approval_id", approval.string("approval_id")))
             SocialCapabilityHint(method: .approvalRespond)
             RelatedConversationLink(source: approval.record("source_context"))
@@ -390,6 +468,26 @@ private struct MeetingGoalWindow: Identifiable {
     let id = UUID()
     var start = Date().addingTimeInterval(3600)
     var end = Date().addingTimeInterval(7200)
+}
+
+private struct MeetingDateField: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    let title: String
+    var accessibilityTitle: String? = nil
+    @Binding var selection: Date
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if dynamicTypeSize.isAccessibilitySize {
+                Text(title).accessibilityHidden(true)
+                DatePicker(title, selection: $selection).labelsHidden()
+                    .accessibilityLabel(accessibilityTitle ?? title)
+            } else {
+                DatePicker(title, selection: $selection)
+                    .accessibilityLabel(accessibilityTitle ?? title)
+            }
+        }
+    }
 }
 
 struct MeetingGoalForm: View {
@@ -419,22 +517,22 @@ struct MeetingGoalForm: View {
     var body: some View {
         if store.available(.collaborationExecute) || store.demo {
             WorkspaceCard {
-                DisclosureGroup("创建会议协作目标") {
+                DisclosureGroup {
                     VStack(alignment: .leading, spacing: 14) {
                         Text("先明确目标、成功标准与本方范围。准备委托后，你仍需核对完整授权问题；双方约定、实际投递与会议举行分别核验。").font(.caption).foregroundStyle(.secondary)
                         if !supported {
-                            Button("读取本机支持的协作功能") { Task { await store.describeCollaboration() } }.buttonStyle(.bordered).disabled(!store.canAct(.collaborationExecute))
+                            Button { Task { await store.describeCollaboration() } } label: { Text("读取本机支持的协作功能").workspaceTapTarget() }.buttonStyle(.bordered).disabled(!store.canAct(.collaborationExecute))
                             if !store.collaborationDescription.isEmpty { Text("本机尚未提供此向导所需的范围字段；可使用下方实际开放的功能。").font(.caption).foregroundStyle(.secondary) }
                         } else {
                             goalFields
                             timeFields
                             permissionFields
                             if let error { InlineNotice(message: error, style: .error) }
-                            Button("核对并准备委托") { prepare() }.buttonStyle(.borderedProminent).disabled(!socialCanSubmit(store, .collaborationExecute) || contactID.isEmpty)
+                            Button { prepare() } label: { Text("核对并准备委托").workspaceTapTarget() }.buttonStyle(.borderedProminent).disabled(!socialCanSubmit(store, .collaborationExecute) || contactID.isEmpty)
                         }
                         SocialCapabilityHint(method: .collaborationExecute)
                     }.padding(.top, 12)
-                }
+                } label: { Text("创建会议协作目标").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }
             }.sheet(item: $confirmation) { SocialConfirmationSheet(action: $0) }
         }
     }
@@ -442,8 +540,9 @@ struct MeetingGoalForm: View {
         VStack(alignment: .leading, spacing: 14) {
             Picker("协作联系人", selection: $contactID) {
                 Text("选择已连接的联系人").tag("")
-                ForEach(contacts, id: \.self) { Text(socialContactName($0)).tag($0.string("contact_id")) }
-            }.pickerStyle(.menu)
+                ForEach(socialRecordRows(contacts, key: "contact_id", fallbackKeys: ["urn"])) { item in Text(socialContactName(item.data)).tag(item.data.string("contact_id")) }
+            }.pickerStyle(.menu).workspaceTapTarget()
+            if contacts.isEmpty { Text("请先在「联系人」中添加联系人，并等待对方接受后再创建会议协作目标。").font(.subheadline).foregroundStyle(.secondary) }
             WorkspaceField(title: "要达成什么目标") { TextField("例如：与设计伙伴安排方案评审", text: $goal, axis: .vertical).workspaceInputStyle() }
             WorkspaceField(title: "怎样算成功") { TextField("例如：双方确认一个 60 分钟线上会议时段", text: $success, axis: .vertical).workspaceInputStyle() }
             WorkspaceField(title: "会议主题") { TextField("主题", text: $topic).workspaceInputStyle() }
@@ -453,14 +552,15 @@ struct MeetingGoalForm: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("可选时间范围 · 本设备时区").font(.subheadline.bold())
             ForEach($windows) { $window in
+                let number = (windows.firstIndex { $0.id == window.id } ?? 0) + 1
                 VStack(alignment: .leading, spacing: 8) {
-                    DatePicker("开始", selection: $window.start)
-                    DatePicker("结束", selection: $window.end)
-                    if windows.count > 1 { Button("移除此时间范围", role: .destructive) { windows.removeAll { $0.id == window.id } }.font(.caption) }
+                    MeetingDateField(title: "开始", accessibilityTitle: "第 \(number) 个范围的开始时间", selection: $window.start)
+                    MeetingDateField(title: "结束", accessibilityTitle: "第 \(number) 个范围的结束时间", selection: $window.end)
+                    if windows.count > 1 { Button(role: .destructive) { windows.removeAll { $0.id == window.id } } label: { Text("移除此时间范围").workspaceTapTarget() }.font(.caption).accessibilityLabel("移除第 \(number) 个时间范围") }
                 }.padding(12).background(Color.listBackground, in: RoundedRectangle(cornerRadius: 12))
             }
-            Button("增加时间范围") { windows.append(MeetingGoalWindow()) }.font(.caption).buttonStyle(.bordered).disabled(windows.count >= 16)
-            DatePicker("本方授权截止", selection: $expiresAt)
+            Button { windows.append(MeetingGoalWindow()) } label: { Text("增加时间范围").workspaceTapTarget() }.font(.caption).buttonStyle(.bordered).disabled(windows.count >= 16)
+            MeetingDateField(title: "本方授权截止", selection: $expiresAt)
             WorkspaceField(title: "最长会议分钟数") { TextField("60", text: $duration).crossPlatformKeyboardType(.decimal).workspaceInputStyle() }
             WorkspaceField(title: "最多披露的候选时段数") { TextField("3", text: $candidates).crossPlatformKeyboardType(.decimal).workspaceInputStyle() }
             WorkspaceField(title: "最多业务动作次数") { TextField("10", text: $budget).crossPlatformKeyboardType(.decimal).workspaceInputStyle() }
@@ -473,14 +573,15 @@ struct MeetingGoalForm: View {
             if businessCapabilities.contains("accept_meeting") { Toggle("接受范围内的会议方案", isOn: $accept) }
             if businessCapabilities.contains("share_slots") { Toggle("分享候选时段", isOn: $shareSlots) }
             if businessCapabilities.contains("share_resource") && !resources.isEmpty {
-                DisclosureGroup("允许分享的注册资料") {
+                DisclosureGroup {
                     VStack(alignment: .leading, spacing: 10) {
-                        ForEach(resources, id: \.self) { resource in
+                        ForEach(socialRecordRows(resources, key: "resource_id")) { item in
+                            let resource = item.data
                             Toggle(resource.string("title", default: resource.string("resource_id")), isOn: Binding(get: { resourceIDs.contains(resource.string("resource_id")) }, set: { selected in if selected { resourceIDs.insert(resource.string("resource_id")) } else { resourceIDs.remove(resource.string("resource_id")) } }))
-                            DisclosureGroup("核对资料全文") { Text(resource.string("text")).font(.caption).textSelection(.enabled) }
+                            DisclosureGroup { Text(resource.string("text")).font(.caption).textSelection(.enabled) } label: { Text("核对资料全文").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }
                         }
                     }.padding(.top, 8)
-                }
+                } label: { Text("允许分享的注册资料").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }
             }
             Text("允许分享只涵盖所选资料全文，不代表已经披露。此委托不会自动开启有限后台运行。").font(.caption).foregroundStyle(.secondary)
         }
@@ -515,6 +616,8 @@ struct CollaborationActionForm: View {
     @State private var values: [String: String] = [:]
     @State private var error: String?
     @State private var confirmation: SocialConfirmation?
+    @ScaledMetric(relativeTo: .body) private var textEditorHeight = 85.0
+    @ScaledMetric(relativeTo: .caption) private var structuredEditorHeight = 140.0
     private var actions: [String] { store.collaborationDescription.strings("actions").filter { $0 != "describe" } }
     private var fields: RemoteRecord { store.collaborationDescription.record("action_fields").record(action) }
     private var required: [String] { fields.strings("required") }
@@ -525,27 +628,27 @@ struct CollaborationActionForm: View {
     var body: some View {
         if store.available(.collaborationExecute) || store.demo {
             WorkspaceCard {
-                DisclosureGroup("更多 Agent 协作功能") {
+                DisclosureGroup {
                     VStack(alignment: .leading, spacing: 14) {
                         Text("读取本机实际开放的功能，再填写所需内容。需要授权的动作会进入确认列表。").font(.caption).foregroundStyle(.secondary)
-                        Button("读取本机可用功能") { Task { await store.describeCollaboration(); if !actions.contains(action) { action = actions.first ?? ""; values = [:] } } }
+                        Button { Task { await store.describeCollaboration(); if !actions.contains(action) { action = actions.first ?? ""; values = [:] } } } label: { Text("读取本机可用功能").workspaceTapTarget() }
                             .buttonStyle(.bordered).disabled(!store.canAct(.collaborationExecute))
                         if !actions.isEmpty {
-                            Picker("选择功能", selection: $action) { ForEach(actions, id: \.self) { Text(socialActionLabel($0)).tag($0) } }.pickerStyle(.menu)
+                            Picker("选择功能", selection: $action) { ForEach(actions, id: \.self) { Text(socialActionLabel($0)).tag($0) } }.pickerStyle(.menu).workspaceTapTarget()
                                 .onChange(of: action) { _, _ in values = [:]; error = nil }
                             ForEach(required + optional.filter { !required.contains($0) }, id: \.self) { field in
-                                WorkspaceField(title: socialFieldLabel(field) + (required.contains(field) ? " *" : "（可选）"), hint: structured.contains(field) ? "填写有效的 JSON；全文会在提交前再次展示。" : nil) {
+                                WorkspaceField(title: socialFieldLabel(field) + (required.contains(field) ? "（必填）" : "（可选）"), hint: structured.contains(field) ? "填写有效的 JSON；全文会在提交前再次展示。" : nil) {
                                     if structured.contains(field) || ["text", "query", "reference"].contains(field) {
-                                        TextEditor(text: binding(field)).font(structured.contains(field) ? .system(.caption, design: .monospaced) : .body).frame(minHeight: structured.contains(field) ? 140 : 85).padding(8).background(Color.listBackground, in: RoundedRectangle(cornerRadius: 10))
+                                        TextEditor(text: binding(field)).font(structured.contains(field) ? .system(.caption, design: .monospaced) : .body).frame(minHeight: structured.contains(field) ? structuredEditorHeight : textEditorHeight).padding(8).background(Color.listBackground, in: RoundedRectangle(cornerRadius: 10)).accessibilityLabel(socialFieldLabel(field) + (required.contains(field) ? "，必填" : "，可选"))
                                     } else { TextField(socialFieldLabel(field), text: binding(field)).crossPlatformAutocapitalization().autocorrectionDisabled().workspaceInputStyle() }
                                 }
                             }
                             if let error { InlineNotice(message: error, style: .error) }
-                            Button("核对并执行所选功能") { prepare() }.buttonStyle(.borderedProminent).disabled(!socialCanSubmit(store, .collaborationExecute) || action.isEmpty)
+                            Button { prepare() } label: { Text("核对并执行所选功能").workspaceTapTarget() }.buttonStyle(.borderedProminent).disabled(!socialCanSubmit(store, .collaborationExecute) || action.isEmpty)
                         }
                         SocialCapabilityHint(method: .collaborationExecute)
                     }.padding(.top, 12)
-                }
+                } label: { Text("更多 Agent 协作功能").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }
             }.sheet(item: $confirmation) { SocialConfirmationSheet(action: $0) }
         }
     }
@@ -581,7 +684,7 @@ struct SocialRecordAction: View {
     private var blockedReason: String? { socialDeletionReason(store, kind: kind, id: recordID) }
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button("从账户列表删除此记录", role: .destructive) { confirming = true }.font(.caption).buttonStyle(.bordered)
+            Button(role: .destructive) { confirming = true } label: { Text("从账户列表删除此记录").workspaceTapTarget() }.font(.caption).buttonStyle(.bordered)
                 .disabled(store.demo || store.busy != nil || recordID.isEmpty || blockedReason != nil)
             if let blockedReason { Text(blockedReason).font(.caption2).foregroundStyle(.secondary) }
         }.confirmationDialog("删除「\(title)」的账户记录？", isPresented: $confirming, titleVisibility: .visible) {
@@ -600,20 +703,19 @@ struct DeletedSocialRecordsView: View {
     var body: some View {
         if !records.isEmpty {
             WorkspaceCard {
-                DisclosureGroup("已删除记录 · \(records.count)") {
+                DisclosureGroup {
                     VStack(alignment: .leading, spacing: 12) {
                         ForEach(records) { record in
-                            HStack(alignment: .top) {
+                            WorkspaceAdaptiveStack {
                                 VStack(alignment: .leading, spacing: 5) {
                                     Text(record.title ?? record.id).font(.subheadline)
                                     Text("删除于 " + socialDate(.number(record.updatedAt))).font(.caption).foregroundStyle(.secondary)
                                 }
-                                Spacer()
-                                Button("恢复显示") { restoring = record; confirming = true }.font(.caption).buttonStyle(.bordered).disabled(store.demo || store.busy != nil)
+                                Button { restoring = record; confirming = true } label: { Text("恢复显示").workspaceTapTarget() }.font(.caption).buttonStyle(.bordered).disabled(store.demo || store.busy != nil).accessibilityLabel("恢复显示「\(record.title ?? record.id)」")
                             }
                         }
                     }.padding(.top, 10)
-                }
+                } label: { Text("已删除记录 · \(records.count)").frame(maxWidth: .infinity, alignment: .leading).workspaceTapTarget() }
             }.confirmationDialog("恢复这条账户记录？", isPresented: $confirming, titleVisibility: .visible) {
                 Button("恢复显示") { if let record = restoring { Task { await store.setRecordHidden(kind: kind, id: record.id, hidden: false) } } }
                 Button("取消", role: .cancel) { }
@@ -627,7 +729,7 @@ struct RelatedConversationLink: View {
     let source: RemoteRecord
     var body: some View {
         if let verified = sourceConversation(["source_context": .object(source)]) {
-            Button { Task { await store.navigateToConversation(id: verified.conversationId, turnID: verified.turnId) } } label: { Label("查看关联对话", systemImage: "bubble.left.and.bubble.right") }
+            Button { Task { await store.navigateToConversation(id: verified.conversationId, turnID: verified.turnId) } } label: { Label("查看关联对话", systemImage: "bubble.left.and.bubble.right").workspaceTapTarget() }
                 .font(.caption).buttonStyle(.bordered).disabled(store.busy != nil || store.demo)
         }
         if !source.isEmpty { SnapshotDetails(data: source) }
@@ -642,6 +744,26 @@ struct SocialCapabilityHint: View {
             Text(store.demo ? "演示模式不会提交操作。" : store.available(method) ? "恢复连接、完成本机配对并核实待定操作后可提交。" : "当前连接尚未开放此功能，请检查连接设置或从 Agent 原生渠道处理。")
                 .font(.caption).foregroundStyle(.secondary)
         }
+    }
+}
+
+struct SocialRecordRow: Identifiable {
+    let id: String
+    let data: RemoteRecord
+}
+
+// Business IDs preserve row identity when content changes or another record is inserted.
+// Incomplete legacy records use their content; duplicate identities remain distinct.
+func socialRecordRows(_ records: [RemoteRecord], key: String, fallbackKeys: [String] = [], namespaceKey: String? = nil) -> [SocialRecordRow] {
+    var occurrences: [String: Int] = [:]
+    return records.map { record in
+        let stableKey = ([key] + fallbackKeys).first { !record.string($0).isEmpty }
+        let identity = stableKey.map { $0 + ":" + record.string($0) } ?? "content:" + socialPretty(record)
+        let namespace = namespaceKey.map { record.string($0) } ?? ""
+        let base = namespace + ":" + identity
+        let occurrence = occurrences[base, default: 0]
+        occurrences[base] = occurrence + 1
+        return SocialRecordRow(id: base + "#" + String(occurrence), data: record)
     }
 }
 
@@ -679,6 +801,7 @@ struct SocialCapabilityHint: View {
     var result = params; result["source_conversation_id"] = .string(store.conversationID); return result
 }
 func socialContactName(_ contact: RemoteRecord) -> String { contact.strings("aliases").first(where: { !$0.isEmpty }) ?? (contact.string("alias").isEmpty ? contact.string("contact_id", default: "联系人") : contact.string("alias")) }
+func peerContentApproved(_ record: RemoteRecord) -> Bool { record.record("content_review").string("status") == "approved" }
 func socialValidUrn(_ value: String) -> Bool { value.count <= 256 && value.range(of: "^urn:[A-Za-z0-9][A-Za-z0-9._:-]*:[A-Za-z0-9][A-Za-z0-9._-]*$", options: .regularExpression) != nil }
 func socialRemoteDate(_ value: JSONValue?) -> Date? {
     if let seconds = value?.numberValue, seconds.isFinite { return Date(timeIntervalSince1970: seconds < 1_000_000_000_000 ? seconds : seconds / 1000) }

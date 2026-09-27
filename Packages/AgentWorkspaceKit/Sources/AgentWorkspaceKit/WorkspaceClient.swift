@@ -254,6 +254,71 @@ public actor WorkspaceClient {
     }
 
     public func fetchActivity() async throws -> RemoteRecord { try await decoded(path: ["api", "workspace", "activity"]) }
+    public func previewContentReport(reportID: String, agentID: String, kind: String, recordID: String) async throws -> RemoteRecord {
+        try Self.validateReportTarget(reportID: reportID, agentID: agentID, kind: kind, recordID: recordID)
+        let result: RemoteRecord = try await decoded(path: ["api", "moderation", "reports", "preview"], method: "POST",
+            json: ["reportId": .string(reportID), "agentId": .string(agentID), "target": ["kind": .string(kind), "id": .string(recordID)]], requiredStatus: 200)
+        guard result.string("reportId") == reportID, !result.string("previewToken").isEmpty,
+              result["evidence"]?.stringValue != nil, result.string("evidence").utf8.count <= 4000 else { throw WorkspaceClientError.invalidResponse }
+        return result
+    }
+
+    /// Submit only after the exact evidence is previewed and explicitly authorized.
+    /// Lost responses are verified by ID; this method never automatically retries.
+    public func submitContentReport(reportID: String, agentID: String, kind: String, recordID: String,
+                                    reason: String, comment: String, evidence: String, previewToken: String) async throws -> RemoteRecord {
+        do {
+            try Self.validateReportTarget(reportID: reportID, agentID: agentID, kind: kind, recordID: recordID)
+            guard ["harassment", "hate", "sexual", "violence", "spam", "other"].contains(reason),
+                  comment.utf8.count <= 2000, evidence.utf8.count <= 4000, !previewToken.isEmpty, previewToken.utf8.count <= 8192 else {
+                throw WorkspaceClientError.custom("请核对举报原因、说明和本次证据预览。")
+            }
+            try Task.checkCancellation(); try restoreCookies()
+        } catch { throw ContentReportError(error.localizedDescription, uncertain: false) }
+        do {
+            let result: RemoteRecord = try await decoded(path: ["api", "moderation", "reports"], method: "POST",
+                json: ["reportId": .string(reportID), "agentId": .string(agentID), "target": ["kind": .string(kind), "id": .string(recordID)],
+                       "reason": .string(reason), "comment": .string(comment), "evidence": .string(evidence), "previewToken": .string(previewToken), "consent": true], requiredStatus: 200)
+            let report = result.record("report")
+            guard Self.validReport(report, expectedID: reportID), report.string("agentId") == agentID, report.string("reason") == reason,
+                  report.record("target").string("kind") == kind, report.record("target").string("id") == recordID else { throw WorkspaceClientError.invalidResponse }
+            return report
+        } catch {
+            let status: Int?
+            if case WorkspaceClientError.unauthorized = error { status = 401 }
+            else if case WorkspaceClientError.serverError(let code) = error { status = code }
+            else if let failure = error as? HTTPFailure { status = failure.status }
+            else { status = nil }
+            let rejected = status.map { (400..<500).contains($0) } ?? false
+            throw ContentReportError(rejected ? error.localizedDescription : "未收到明确举报回执，请按原编号查看记录。本应用不会自动重复提交。", uncertain: !rejected, httpStatus: status)
+        }
+    }
+
+    public func fetchContentReports() async throws -> [RemoteRecord] {
+        let result: RemoteRecord = try await decoded(path: ["api", "moderation", "reports"], query: [URLQueryItem(name: "limit", value: "20")], requiredStatus: 200)
+        guard let reports = result["reports"]?.arrayValue?.compactMap(\.objectValue), reports.count <= 20,
+              result["reports"]?.arrayValue?.count == reports.count, Set(reports.map { $0.string("id") }).count == reports.count,
+              reports.allSatisfy({ Self.validReport($0) }) else { throw WorkspaceClientError.invalidResponse }
+        return reports
+    }
+    public func fetchContentReport(reportID: String) async throws -> RemoteRecord {
+        guard UUID(uuidString: reportID) != nil else { throw WorkspaceClientError.custom("举报编号无效。") }
+        let result: RemoteRecord = try await decoded(path: ["api", "moderation", "reports", reportID], requiredStatus: 200)
+        let report = result.record("report")
+        guard Self.validReport(report, expectedID: reportID) else { throw WorkspaceClientError.invalidResponse }
+        return report
+    }
+    private static func validateReportTarget(reportID: String, agentID: String, kind: String, recordID: String) throws {
+        guard UUID(uuidString: reportID) != nil, isStableID(agentID), isStableID(recordID),
+              ["contact", "contact_request", "inbox", "turn", "collaboration"].contains(kind) else { throw WorkspaceClientError.custom("举报对象无效，请重新打开账户中的记录。") }
+    }
+    private static func validReport(_ report: RemoteRecord, expectedID: String? = nil) -> Bool {
+        UUID(uuidString: report.string("id")) != nil && isStableID(report.string("agentId")) && (expectedID == nil || report.string("id") == expectedID)
+            && ["pending", "reviewing", "resolved", "dismissed"].contains(report.string("status"))
+            && ["harassment", "hate", "sexual", "violence", "spam", "other"].contains(report.string("reason"))
+            && isStableID(report.record("target").string("id"))
+            && ["contact", "contact_request", "inbox", "turn", "collaboration"].contains(report.record("target").string("kind"))
+    }
     public func fetchAccount() async throws -> RemoteRecord { try await decoded(path: ["api", "auth", "account"]) }
     public func resendVerification(email: String) async throws -> RemoteRecord {
         try await decoded(path: ["api", "auth", "resend-verification"], method: "POST", json: ["email": .string(email)])
@@ -263,6 +328,39 @@ public actor WorkspaceClient {
     }
     public func changePassword(currentPassword: String, password: String) async throws -> RemoteRecord {
         try await decoded(path: ["api", "auth", "change-password"], method: "POST", json: ["currentPassword": .string(currentPassword), "password": .string(password)])
+    }
+
+    /// Call only after explicit destructive confirmation. Sends once; never automatically retries.
+    /// Cookie and recovery cleanup is separate, so local storage failures cannot disguise remote success.
+    public func deleteAccount(currentPassword: String, expectedAccountID: String) async throws {
+        guard !currentPassword.isEmpty, currentPassword.utf8.count <= 1024, !expectedAccountID.isEmpty, expectedAccountID.count <= 128 else {
+            throw AccountDeletionError("请填写有效的当前密码。", uncertain: false)
+        }
+        do { try Task.checkCancellation(); try restoreCookies() }
+        catch { throw AccountDeletionError(error.localizedDescription, uncertain: false) }
+        do {
+            struct Confirmation: Decodable { let deleted: Bool }
+            let result: Confirmation = try await decoded(path: ["api", "auth", "delete-account"], method: "POST",
+                json: ["currentPassword": .string(currentPassword), "confirmation": "DELETE", "expectedAccountId": .string(expectedAccountID)],
+                captureSessionCookies: false, requiredStatus: 200)
+            guard result.deleted else { throw WorkspaceClientError.invalidResponse }
+        } catch {
+            let status: Int?
+            if case WorkspaceClientError.unauthorized = error { status = 401 }
+            else if case WorkspaceClientError.serverError(let code) = error { status = code }
+            else if let failure = error as? HTTPFailure { status = failure.status }
+            else { status = nil }
+            let rejected = status.map { (400..<500).contains($0) } ?? false
+            let message: String
+            if status == 404 || status == 405 {
+                message = "当前工作区尚未提供账户删除接口。请先更新服务端或联系工作区运营者。"
+            } else if !rejected {
+                message = "未收到明确的删除结果，账户可能已被删除。请先核实账户状态或联系工作区运营者。"
+            } else {
+                message = error.localizedDescription
+            }
+            throw AccountDeletionError(message, uncertain: !rejected, httpStatus: status)
+        }
     }
     public func previewOnboarding(code: String) async throws -> RemoteRecord {
         try Self.validateOnboardingCode(code)
@@ -351,9 +449,11 @@ public actor WorkspaceClient {
         "invalid_params": "请求内容未通过 Agent 校验，请核对填写内容并刷新最新状态。",
         "request_conflict": "这次请求已绑定其他内容，请先刷新并核实原操作结果。",
         "pairing_expired": "本机配对已过期，请重新授权后再使用。",
-        "pairing_revoked": "本机配对已撤销，请重新授权后再使用。"
+        "pairing_revoked": "本机配对已撤销，请重新授权后再使用。",
+        "peer_content_safety_required": "Agent 主机尚未提供内容审核保护，本次新回合未受理。请升级实际 Hermes adapter 后重试。",
+        "peer_content_safety_changed": "Agent 主机的内容审核能力已变化，原回合可能已执行。请读取原会话核实，升级主机后再决定。"
     ]
-    private static let notExecutedErrors: Set<String> = ["not_paired", "owner_mismatch", "method_not_allowed", "unsupported_method", "invalid_params", "queue_full", "pairing_expired", "pairing_revoked"]
+    private static let notExecutedErrors: Set<String> = ["not_paired", "owner_mismatch", "method_not_allowed", "unsupported_method", "invalid_params", "queue_full", "pairing_expired", "pairing_revoked", "peer_content_safety_required"]
 
     private nonisolated static func validateCursor(_ cursor: String) throws {
         guard cursor.range(of: "^[A-Za-z0-9._:-]{1,128}$", options: .regularExpression) != nil else {
@@ -389,7 +489,8 @@ public actor WorkspaceClient {
     }
 
     private func decoded<T: Decodable>(path: [String], method: String = "GET", query: [URLQueryItem] = [], json: RemoteRecord? = nil,
-                                       body: Data? = nil, contentType: String = "application/json", deadline: Date? = nil) async throws -> T {
+                                       body: Data? = nil, contentType: String = "application/json", deadline: Date? = nil,
+                                       captureSessionCookies: Bool = true, requiredStatus: Int? = nil) async throws -> T {
         try Task.checkCancellation()
         try restoreCookies()
         let epoch = generation
@@ -423,7 +524,7 @@ public actor WorkspaceClient {
         guard generation == epoch else { throw CancellationError() }
         guard let http = response as? HTTPURLResponse, http.url?.host == baseURL.host, http.url?.scheme == baseURL.scheme,
               http.url?.port == baseURL.port else { throw WorkspaceClientError.invalidResponse }
-        try captureCookies(http)
+        if captureSessionCookies { try captureCookies(http) }
         if path == ["api", "auth", "callback", "credentials"], let object = try? JSONDecoder().decode(RemoteRecord.self, from: data),
            case .emailNotVerified? = Self.loginFailure(object) { throw WorkspaceClientError.emailNotVerified }
         if http.statusCode == 401 { throw WorkspaceClientError.unauthorized }
@@ -433,6 +534,7 @@ public actor WorkspaceClient {
             }
             throw WorkspaceClientError.serverError(http.statusCode)
         }
+        if let requiredStatus, http.statusCode != requiredStatus { throw WorkspaceClientError.invalidResponse }
         do { return try JSONDecoder().decode(T.self, from: data) }
         catch { throw WorkspaceClientError.invalidResponse }
     }

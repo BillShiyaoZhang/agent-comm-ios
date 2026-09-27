@@ -18,6 +18,14 @@
 
 ## 服务端版本与兼容检查
 
+内容安全这一轮需要同时更新 Web、SDK/helper 和实际 Hermes adapter。新内容发送要求 Web 返回 `contentSafety.version = 1`，且 runtime 的 `peer_content_safety` 明确声明 `version = 1`、`mode = owner_review`、`automatic_peer_model_execution = false`。旧版本仍可读取已有个人会话；不能仅修改能力字段继续运行旧消费路径。
+
+新增 `contacts.block`、`contacts.unblock`、`inbox.review_preview` 和 `inbox.review` 后共 18 项 RPC。安全操作不要求 AI 内容共享许可，但必须保留原配对和政策检查。升级不会自动扩大配对权限；只有主人明确开放相应方法才可使用。屏蔽回执与联系人/协作状态使用持久 `safety_revision` 防止迟到快照恢复旧状态。
+
+SDK 数据库由 schema 1 单向迁移到 2，以阻止旧 reader 再次绕过内容审核。迁移保留记录；升级前备份，并按 SDK 安装说明协调 helper 与后台 adapter 版本。不得用旧 wheel 直接打开升级后的数据库回滚。
+
+举报使用独立 Web API：先获取单条记录预览，再明确同意提交；不自动附上所有聊天，不替用户联系对端。原生端先保存原编号和确切请求到当前账户 Keychain，未知回执只核实或明确重试同一举报。设置中的举报记录显示服务端处理状态与回复。公开 `/community`、审核入口和处理 CLI 需要随 Web 一并发布，生产运营责任仍需落实。
+
 Apple 客户端通过 Web 的账户接口工作，不直接连接 Go platform。填写 Web/nginx 的根地址，例如 `https://agent-communication.online`，不要填写 `/dashboard`、helper 地址或单独的消息转交服务地址。
 
 它需要支持以下工作区约定的 Web 版本：
@@ -36,6 +44,7 @@ Apple 客户端通过 Web 的账户接口工作，不直接连接 Go platform。
 - `/api/agents/:id` 支持连接重命名与删除。删除会清除当前账户该连接的保存副本，不停止 Agent 执行或撤销本机配对；未确认操作和处理中回合需要先核实。
 - `/api/onboarding/claim/:code` 提供一次性连接申请预览和明确确认。控制台身份与托管证书由 Web 服务管理，手机不持有 Agent 或控制台私钥。
 - 邮箱注册返回 `202` 邮件验证申请；新账户验证后才能登录。找回密码与重新发送验证邮件使用现行 `/api/auth` 路由。
+- `/privacy` 提供当前运营者的公开政策；`POST /api/auth/delete-account` 要求当前会话、密码、`confirmation: "DELETE"` 与用于一致性核对的 `expectedAccountId`。只有 HTTP 200 且 `deleted: true` 才证明在线账户删除成功。本次补齐在配套 Web 工作树中，尚未发布；旧后端不可据此声称支持账户删除。
 
 2026-09-27 本次更新按本机 deploy `65be7df` 固定的 Web `78c019b` 核对新增接口，并沿用其 `packages/client-contract` 共享模块中的权限、时间及不确定写入语义。Web 的接口校验、客户端与同步逻辑使用该模块；请求指纹和已保存的发送记录采用规范化 JSON 比较，并兼容旧会话参数顺序。Swift 保留原有稳定发送编码以兼容旧后端。
 
@@ -50,12 +59,14 @@ Apple 客户端通过 Web 的账户接口工作，不直接连接 Go platform。
 | 模块 | 职责 | 使用者 |
 | --- | --- | --- |
 | [`Packages/AgentWorkspaceKit`](../Packages/AgentWorkspaceKit/README.md) | Foundation 模型、NextAuth 会话、HTTP/RPC、请求关联检查、合并与配对规则、Keychain 存储 | iOS、macOS、visionOS 及其他 Swift 客户端 |
-| Web 的 [`packages/client-contract`](https://github.com/BillShiyaoZhang/agent-collaboration-web/tree/78c019bf132e7b55e31b5987ba11617a6ba15662/packages/client-contract) | 不依赖 Next/React 的 JS 客户端、协议验证、同步策略、类型、JSON Schema 和跨语言 fixtures | Web 直接复用；Swift 和其他语言客户端用 Schema 与 fixtures 核对接口 |
+| Web 的 [`packages/client-contract`](https://github.com/BillShiyaoZhang/agent-collaboration-web/tree/c69757d08dda86d8683e6a83e0349ced201c5edf/packages/client-contract) | 不依赖 Next/React 的 JS 客户端、协议验证、同步策略、类型、JSON Schema 和跨语言 fixtures | Web 直接复用；Swift 和其他语言客户端用 Schema 与 fixtures 核对接口 |
 | `WorkspaceStore` | 页面状态、前台同步、会话恢复、发送日志与 UI 动作 | Apple 应用层 |
 
 网络层对接 Web 的账号会话与工作区接口；Web 继续负责与 platform/helper/runtime 的签名和加密传输。Agent 身份私钥不进入手机。详见 [架构与兼容说明](ARCHITECTURE.md)。
 
 ## 同步与恢复
+
+发送对话或协作内容前，原生客户端明确说明将内容交给当前工作区和你配置的 Agent；首次允许后需再次点按发送。许可只保留在当前登录会话与当前 Agent，冷启动、切换 Agent 或重新登录需重新确认，在对话/协作的“管理共享授权”可撤回。拒绝不影响查看已保存内容。模型与工具由用户自行配置，现行 Agent 协议不提供准确供应商及配置变更信息；此许可不代表完整第三方保护核验。
 
 - 前台约每 4 秒读取账号工作区，后台停止设备轮询；服务端原有同步继续运行。回到前台立即读取。
 - 更新失败保留本次会话已加载的数据；快照以服务端时间判断新旧，已结束回合不会被旧缓存改回处理中。
@@ -66,6 +77,10 @@ Apple 客户端通过 Web 的账户接口工作，不直接连接 Go platform。
 - 回应审批前再次读取当前确切问题、不可变审批 ID 和对象，变化或已处理时要求重新查看。认证结果仍不明确时继续显示待核实，不把传输回执当作成功。
 - 确认受理只代表 Agent 接收了回合；完成结果来自后续同步。协作动作被本机队列接收也不等于对方同意或事项完成。接受好友请求允许普通通信，不自动授予协作范围或核实现实身份。
 - 冷启动恢复完整历史需要工作区网络连接；完整历史保存在服务端加密账号副本，本机不额外持久化全量聊天快照。
+
+## 账户删除与本机恢复
+
+退出登录保留本机恢复数据；删除账户是独立操作。成功后清当前账户的恢复 Keychain 和登录会话；本机清理失败会保存待办，重启仅继续本机清理，不重复服务端删除。完整边界和发布条件见 [Apple 检查](APPLE_DESIGN_AUDIT.md)。
 
 ## 验证
 
