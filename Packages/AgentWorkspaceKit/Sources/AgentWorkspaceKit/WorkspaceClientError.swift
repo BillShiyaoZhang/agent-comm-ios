@@ -3,6 +3,7 @@ import Foundation
 public enum WorkspaceClientError: Error, LocalizedError, Sendable {
     case invalidURL
     case invalidCredentials
+    case emailNotVerified
     case unauthorized
     case serverError(Int)
     case custom(String)
@@ -13,6 +14,7 @@ public enum WorkspaceClientError: Error, LocalizedError, Sendable {
         switch self {
         case .invalidURL: return "请填写有效的服务器地址。公网连接需要 HTTPS；HTTP 仅可用于本机或局域网。"
         case .invalidCredentials: return "邮箱或密码不正确，请重新输入。"
+        case .emailNotVerified: return "请先打开验证邮件完成邮箱验证，再登录。可以重新发送验证邮件。"
         case .unauthorized: return "登录已过期，请重新登录。"
         case .serverError(let status): return "服务器暂时无法完成请求（\(status)）。"
         case .custom(let message): return message

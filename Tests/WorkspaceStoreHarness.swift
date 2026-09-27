@@ -25,20 +25,31 @@ final class NetworkManager: ObservableObject {
     @Published var isAuthenticated = true
     var sessionRevision = 0
     var workspaces: [String: WorkspaceAgent] = [:]
+    var conversationStates: [String: [String: WorkspaceConversationState]] = [:]
     var overviewIDs: [String] = []
     var reads: [(agent: String, conversation: String?, before: String?)] = []
     var requests: [(account: String, method: String)] = []
     var calls: [PendingCall] = []
+    var policy: RemoteRecord = ["status": .string("legacy"), "paused": .bool(false), "can_use_workbench": .bool(true)]
+    var policyHandler: (() async throws -> RemoteRecord)?
+    var reserveHandler: ((String, PendingCall, String?) async throws -> WorkspaceOperation)?
+    var reservedCalls: [PendingCall] = []
+    var operationUpdates: [(String, String)] = []
     var executeHandler: ((String, PendingCall) async throws -> RemoteRecord)?
     var fetchHandler: ((String, String?, String?) async throws -> WorkspaceAgent)?
     var selectHandler: ((String, String?) async throws -> WorkspaceAgent)?
+    var conversationUpdateHandler: ((String, String?, RemoteRecord) async throws -> RemoteRecord)?
 
     func reset(_ account: String) {
         sessionRevision += 1
         currentUser = SessionUser(id: account, email: account + "@example.com")
         isAuthenticated = true
         workspaces = [:]; overviewIDs = []; reads = []; requests = []; calls = []
+        conversationStates = [:]
         executeHandler = nil; fetchHandler = nil; selectHandler = nil
+        conversationUpdateHandler = nil
+        policy = ["status": .string("legacy"), "paused": .bool(false), "can_use_workbench": .bool(true)]
+        policyHandler = nil; reserveHandler = nil; reservedCalls = []; operationUpdates = []
         SecureStore.memory = [:]
         SecureStore.failReads = false
     }
@@ -52,10 +63,13 @@ final class NetworkManager: ObservableObject {
         reads.append((agentId, conversationId, before))
         if let fetchHandler { return try await fetchHandler(agentId, conversationId, before) }
         guard var result = workspaces[agentId] else { throw HarnessFailure.message("Missing fixture " + agentId) }
+        let savedID = result.activeConversationId
+        if let state = result.activeConversationState { conversationStates[agentId, default: [:]][savedID] = state }
         if let conversationId {
             result.activeConversationId = conversationId
             if result.conversation?.string("conversation_id") != conversationId { result.conversation = nil }
         }
+        result.activeConversationState = conversationStates[agentId]?[result.activeConversationId] ?? .init()
         return result
     }
     func scheduleSync(agentId: String?) async throws { record("sync") }
@@ -69,13 +83,84 @@ final class NetworkManager: ObservableObject {
     func selectConversation(agentId: String, conversationId: String?) async throws -> WorkspaceAgent {
         record("selection")
         if let selectHandler { return try await selectHandler(agentId, conversationId) }
+        if let data = workspaces[agentId], let state = data.activeConversationState { conversationStates[agentId, default: [:]][data.activeConversationId] = state }
         workspaces[agentId]?.activeConversationId = conversationId ?? ""
+        workspaces[agentId]?.activeConversationState = conversationStates[agentId]?[conversationId ?? ""] ?? .init()
         return try await fetchWorkspace(agentId: agentId, conversationId: conversationId ?? "")
     }
     func dismissSubmission(agentId: String, requestId: String) async throws -> WorkspaceAgent {
         workspaces[agentId]?.submission = nil
         return try await fetchWorkspace(agentId: agentId)
     }
+    func fetchPolicy() async throws -> RemoteRecord {
+        record("policy")
+        if let policyHandler { return try await policyHandler() }
+        return policy
+    }
+    func updatePolicy(_ body: RemoteRecord) async throws -> RemoteRecord {
+        record("policy-update")
+        policy["paused"] = .bool(false); policy["can_use_workbench"] = .bool(true)
+        return policy
+    }
+    func pausePolicy() async throws { record("policy-pause"); policy["paused"] = .bool(true); policy["can_use_workbench"] = .bool(false) }
+    func fetchOperations(agentId: String) async throws -> [WorkspaceOperation] {
+        record("operations")
+        return workspaces[agentId]?.operations ?? []
+    }
+    func reserveOperation(agentId: String, call: PendingCall, conversationId: String? = nil) async throws -> WorkspaceOperation {
+        record("reserve"); reservedCalls.append(call)
+        if let reserveHandler { return try await reserveHandler(agentId, call, conversationId) }
+        if let original = workspaces[agentId]?.operations?.first(where: { $0.call == call }) { return original }
+        let item = WorkspaceOperation(call: call, conversationId: conversationId, createdAt: Date().timeIntervalSince1970 * 1000, updatedAt: Date().timeIntervalSince1970 * 1000)
+        var items = workspaces[agentId]?.operations ?? []
+        if !items.contains(where: { $0.call.requestId == call.requestId }) { items.append(item) }
+        workspaces[agentId]?.operations = items
+        return item
+    }
+    func updateOperation(agentId: String, requestId: String, phase: String, message: String, retryable: Bool) async throws -> WorkspaceOperation {
+        record("operation-update"); operationUpdates.append((requestId, phase))
+        guard var item = workspaces[agentId]?.operations?.first(where: { $0.call.requestId == requestId }) else { throw HarnessFailure.message("Missing reserved operation") }
+        if !item.unresolved { return item }
+        item.phase = "uncertain"; item.message = message; item.retryable = retryable; item.updatedAt = Date().timeIntervalSince1970 * 1000
+        workspaces[agentId]?.operations?.removeAll(where: { $0.call.requestId == requestId })
+        workspaces[agentId]?.operations?.append(item)
+        return item
+    }
+    func fetchNotifications(filter: String = "all", before: Double? = nil) async throws -> RemoteRecord {
+        record("notifications")
+        return ["items": .array([]), "unread": .number(0), "pending": .number(0), "before": .null, "hasMore": .bool(false)]
+    }
+    func markNotificationRead(agentId: String, id: String, revision: Int) async throws { record("notification-read") }
+    func fetchConversations(agentId: String, query: String = "", archived: String = "active", deleted: String = "active", before: String? = nil) async throws -> RemoteRecord {
+        record("conversations")
+        let data = try JSONEncoder().encode(workspaces[agentId]?.conversations ?? [])
+        let items = try JSONDecoder().decode(JSONValue.self, from: data)
+        return ["items": items, "before": .null, "hasMore": .bool(false), "scope": .string("saved_account_history")]
+    }
+    func updateConversation(agentId: String, conversationId: String?, patch: RemoteRecord) async throws -> RemoteRecord {
+        record("conversation-update")
+        if let conversationUpdateHandler { return try await conversationUpdateHandler(agentId, conversationId, patch) }
+        if let text = patch["draft"]?.stringValue {
+            let id = conversationId ?? ""
+            var state = conversationStates[agentId]?[id] ?? .init()
+            state.draft = text
+            conversationStates[agentId, default: [:]][id] = state
+            if workspaces[agentId]?.activeConversationId == id { workspaces[agentId]?.activeConversationState = state }
+        }
+        return ["state": .object(patch)]
+    }
+    func renameConnection(agentId: String, name: String) async throws { record("rename"); workspaces[agentId]?.agent.name = name }
+    func removeConnection(agentId: String) async throws { record("remove"); overviewIDs.removeAll(where: { $0 == agentId }); workspaces[agentId] = nil }
+    func saveRecordState(agentId: String, kind: String, id: String, deleted: Bool) async throws -> WorkspaceRecordState {
+        record("record-update")
+        let value = WorkspaceRecordState(kind: kind, id: id, deleted: deleted)
+        workspaces[agentId]?.recordStates = [value]
+        return value
+    }
+    func fetchActivity() async throws -> RemoteRecord { record("activity"); return [:] }
+    func fetchAccount() async throws -> RemoteRecord { record("account"); return ["email": .string(currentUser?.email ?? ""), "verified": .bool(true)] }
+    func previewOnboarding(code: String) async throws -> RemoteRecord { record("onboarding-preview"); return ["status": .string("pending")] }
+    func approveOnboarding(code: String) async throws -> RemoteRecord { record("onboarding-approve"); return ["status": .string("approved"), "agent_id": .string("a")] }
 }
 
 @MainActor
@@ -119,6 +204,33 @@ struct WorkspaceStoreHarness {
         await test("same account re-login invalidates old store operations", sameAccountRelogin)
         await test("polling preserves action errors and separately clears connection errors", preserveActionErrors)
         await test("old account operations stop after account changes", accountChangesDuringSend)
+        await test("paused policy retains saved history and blocks remote reads and writes", pausedPolicyRetainsHistory)
+        await test("unavailable policy retains saved history and blocks remote reads and writes", unavailablePolicyRetainsHistory)
+        await test("collaboration description is a read and does not reserve a mutation", descriptionIsReadOnly)
+        await test("mutations reserve their exact request before remote delivery", reserveBeforeMutation)
+        await test("reservation failure prevents remote mutation delivery", reservationFailureBlocksMutation)
+        await test("restored unresolved operations block a second write to the same subject", restoredMutationBlocksDuplicate)
+        await test("authenticated uncertain execution remains unresolved and is never replayed", authenticatedUncertainMutation)
+        await test("uncertain transport errors preserve the original mutation for explicit retry", transportUncertainMutation)
+        await test("changed approval questions or subjects prevent an obsolete decision", changedApprovalPreventsWrite)
+        await test("an unchanged approval is re-read before its exact decision is submitted", unchangedApprovalIsRevalidated)
+        await test("account changes after mutation reservation prevent delivery", accountChangesDuringReservation)
+        await test("account changes during a mutation stop result updates and follow-up reads", accountChangesDuringMutation)
+        await test("hidden record states respect kind and related IDs and can be restored", hiddenRecordFiltering)
+        await test("newer combined collaboration data takes precedence over older standalone lists", combinedSnapshotPrecedence)
+        await test("conversation and new-chat drafts stay isolated when switching and restarting", conversationDraftIsolation)
+        await test("saved account drafts restore without overwriting unsynchronized local text", savedDraftFallback)
+        await test("a delayed policy read cannot override a successful explicit resume", delayedPolicyReadAfterResume)
+        await test("an unknown collaboration write blocks other actions but permits its exact retry", unresolvedCollaborationBlocksOtherActions)
+        await test("confirmed draft saves release local overrides so another device can update them", confirmedDraftReleasesLocalOverride)
+        await test("a draft edited during saving survives the older save acknowledgement", editingDuringDraftSave)
+        await test("a previous account's draft save acknowledgement cannot clear local recovery", accountChangesDuringDraftSave)
+        await test("an account draft for an empty new conversation hydrates before sending", newConversationAccountDraft)
+        await test("an unsynchronized cleared draft stays cleared across a failed save and switch", clearedDraftSurvivesSwitch)
+        await test("draft saves remain serial after their initiating view task is cancelled", draftSaveQueuePreservesOrder)
+        await test("another device's pending send never absorbs this conversation's draft", foreignSubmissionPreservesScopedDraft)
+        await test("a remotely deleted active conversation clears its transcript and focus", remotelyDeletedConversation)
+        await test("legacy agent-wide drafts migrate into the selected conversation", legacyDraftMigration)
         if failures > 0 { exit(1) }
         print("All workspace store regressions passed.")
     }
@@ -136,7 +248,7 @@ struct WorkspaceStoreHarness {
             agent: WorkspaceConnection(id: id, name: id, urn: "urn:agent:" + id),
             identity: WorkspaceIdentity(virtualUrn: "urn:virtual:test"),
             sync: WorkspaceSync(status: "ready"),
-            snapshots: ["capabilities": WorkspaceSnapshot(data: ["methods": .array([.object(["name": .string("conversation.send"), "available": .bool(true)])])], time: 100)],
+            snapshots: ["capabilities": WorkspaceSnapshot(data: ["methods": .array(RPCMethod.allCases.map { .object(["name": .string($0.rawValue), "available": .bool(true)]) })], time: 100)],
             activeConversationId: conversation,
             conversation: ["conversation_id": .string(conversation), "turns": .array([])]
         )
@@ -391,6 +503,497 @@ struct WorkspaceStoreHarness {
         try expect(!network.requests.contains { $0.account == "new-account" }, "Old store issued a follow-up using the newly logged-in account")
         let newHash = SHA256.hash(data: Data((network.baseUrl + "\u{0}new-account").utf8)).map { String(format: "%02x", $0) }.joined()
         try expect(!SecureStore.memory.keys.contains { $0.contains(newHash) }, "Old store wrote a draft or submission into the new account journal")
+    }
+
+    static func savedHistoryFixture() {
+        network.workspaces["a"]?.conversation?["turns"] = .array([.object(turn("saved-terminal-turn", time: 10, status: "completed"))])
+    }
+
+    static func verifyPolicyBlocksControl(_ store: WorkspaceStore) async throws {
+        store.draft = "Must remain a draft"
+        await store.refresh(schedule: true)
+        await store.send()
+        await store.invoke(.capabilities)
+        await store.invoke(.conversationGet, params: ["conversation_id": .string("conversation-a")])
+        await store.openConversation("unknown-remote-conversation")
+        await store.describeCollaboration()
+        await store.performAction(.inboxMarkRead, params: ["message_id": .string("message-protected")])
+        try expect(!store.canSend && !store.canAct(.inboxMarkRead), "Policy denial still authorizes remote actions")
+        try expect(network.calls.isEmpty && network.reservedCalls.isEmpty, "A control request was delivered while policy access was blocked")
+        try expect(!network.requests.contains(where: { $0.method == "sync" }), "Policy denial scheduled remote synchronization")
+        try expect(store.turns.first?.string("turn_id") == "saved-terminal-turn", "Policy denial discarded saved account history")
+        try expect(store.draft == "Must remain a draft", "Blocked sending erased the user's draft")
+    }
+
+    static func pausedPolicyRetainsHistory() async throws {
+        seed("paused-policy")
+        savedHistoryFixture()
+        network.policy = ["status": .string("signed"), "mode": .string("compliance"), "paused": .bool(true), "confirmed": .bool(true), "can_use_workbench": .bool(false)]
+        let store = WorkspaceStore()
+        await store.refresh()
+        try await verifyPolicyBlocksControl(store)
+    }
+
+    static func unavailablePolicyRetainsHistory() async throws {
+        seed("unavailable-policy")
+        savedHistoryFixture()
+        network.policyHandler = { throw WorkspaceClientError.serverError(503) }
+        let store = WorkspaceStore()
+        await store.refresh()
+        try await verifyPolicyBlocksControl(store)
+        try expect(store.policyError != nil, "Policy verification failure has no explanation")
+    }
+
+    static func descriptionIsReadOnly() async throws {
+        seed("description")
+        let store = WorkspaceStore()
+        await store.refresh()
+        network.executeHandler = { _, call in
+            try expect(call.method == .collaborationExecute && call.params == ["action": .string("describe")], "Description read sent an unexpected request")
+            return ["actions": .array([.string("prepare_task")])]
+        }
+        await store.describeCollaboration()
+        try expect(network.calls.count == 1 && network.reservedCalls.isEmpty, "Read-only description was added to the mutation ledger")
+        try expect(store.collaborationDescription.strings("actions") == ["prepare_task"], "Agent description was not retained")
+    }
+
+    static func reserveBeforeMutation() async throws {
+        seed("reserve-before-send")
+        let store = WorkspaceStore()
+        await store.refresh()
+        let params: RemoteRecord = ["request_id": .string("friend-request-1"), "decision": .string("accept")]
+        network.executeHandler = { id, call in
+            try expect(network.reservedCalls.last == call, "Remote delivery did not match the durably reserved call")
+            try expect(network.workspaces[id]?.operations?.contains(where: { $0.call == call }) == true, "Remote delivery started before durable reservation")
+            return ["request_id": .string("friend-request-1"), "status": .string("accepted")]
+        }
+        await store.performAction(.contactsRespond, params: params)
+        try expect(network.calls.count == 1 && network.reservedCalls.count == 1, "Explicit mutation was not delivered exactly once")
+        try expect(network.calls.first?.params == params, "Reservation changed the original parameters")
+        let sequence = network.requests.map(\.method)
+        try expect(sequence.firstIndex(of: "reserve")! < sequence.firstIndex(of: "execute")!, "Operation reservation did not precede delivery")
+    }
+
+    static func reservationFailureBlocksMutation() async throws {
+        seed("reservation-failure")
+        let store = WorkspaceStore()
+        await store.refresh()
+        network.reserveHandler = { _, _, _ in throw WorkspaceClientError.serverError(503) }
+        await store.performAction(.inboxMarkRead, params: ["message_id": .string("message-1")])
+        try expect(network.reservedCalls.count == 1 && network.calls.isEmpty, "Failed reservation still delivered a write")
+        try expect(store.error != nil || store.actionResult != nil, "Failed reservation has no actionable explanation")
+    }
+
+    static func restoredMutationBlocksDuplicate() async throws {
+        seed("restored-operation")
+        let original = PendingCall(method: .inboxMarkRead, params: ["message_id": .string("message-1")])
+        network.workspaces["a"]?.operations = [WorkspaceOperation(call: original, phase: "uncertain", retryable: true)]
+        let store = WorkspaceStore()
+        await store.refresh()
+        try expect(store.uncertainActions.first?.call == original, "Stored operation did not restore its exact identity")
+        await store.performAction(.inboxMarkRead, params: original.params)
+        try expect(network.calls.isEmpty && network.reservedCalls.isEmpty, "Restoration silently generated a second request for the same subject")
+        await store.refresh()
+        try expect(network.calls.isEmpty, "Polling automatically replayed a restored operation")
+    }
+
+    static func authenticatedUncertainMutation() async throws {
+        seed("authenticated-uncertainty")
+        let store = WorkspaceStore()
+        await store.refresh()
+        network.executeHandler = { id, call in
+            let result: RemoteRecord = ["status": .string("uncertain"), "instruction": .string("Reconcile the original operation")]
+            if let index = network.workspaces[id]?.operations?.firstIndex(where: { $0.call == call }) {
+                network.workspaces[id]?.operations?[index].phase = "uncertain"
+                network.workspaces[id]?.operations?[index].retryable = false
+                network.workspaces[id]?.operations?[index].result = result
+            }
+            return result
+        }
+        await store.performAction(.collaborationExecute, params: ["action": .string("dispatch"), "operation_id": .string("operation-1")])
+        let original = try required(store.uncertainActions.first, "Authenticated uncertainty was reported as a successful write")
+        try expect(original.phase == "uncertain" && !original.retryable, "Ambiguous authenticated effect was made safely retryable")
+        await store.refresh()
+        await store.performAction(.collaborationExecute, params: original.call.params)
+        try expect(network.calls.count == 1, "Uncertain business effect was automatically duplicated")
+        try expect(store.uncertainActions.first?.call == original.call, "Uncertain effect lost its original request identity")
+    }
+
+    static func transportUncertainMutation() async throws {
+        seed("transport-uncertainty")
+        let store = WorkspaceStore()
+        await store.refresh()
+        network.executeHandler = { _, call in throw ControlCallError("A receipt has not arrived", call: call, retryable: true, uncertain: true) }
+        await store.performAction(.inboxMarkRead, params: ["message_id": .string("message-1")])
+        let original = try required(store.uncertainActions.first, "Uncertain transport failure discarded the original mutation")
+        try expect(original.phase == "uncertain" && original.retryable, "Uncertain transport was presented as a final rejection")
+        await store.refresh()
+        try expect(network.calls.count == 1, "Refresh automatically retried a write")
+        network.executeHandler = { _, _ in ["message_id": .string("message-1"), "status": .string("read")] }
+        await store.retryAction(original)
+        try expect(network.calls.count == 2 && network.calls[0] == network.calls[1], "Explicit retry changed the original request ID or parameters")
+    }
+
+    static func approvalFixture() -> RemoteRecord {
+        ["approval_id": .string("approval-1"), "subject_id": .string("task-1"), "question": .string("Share the complete registered resource with this recipient?"), "status": .string("presenting")]
+    }
+
+    static func changedApprovalPreventsWrite() async throws {
+        for field in ["question", "subject_id"] {
+            seed("changed-approval-" + field)
+            let store = WorkspaceStore()
+            await store.refresh()
+            let shown = approvalFixture()
+            var latest = shown
+            latest[field] = .string(field == "question" ? "Changed question" : "another-task")
+            let refreshed = latest
+            network.executeHandler = { _, call in
+                try expect(call.method == .collaborationState, "Changed approval submitted a mutation")
+                return ["pending_confirmations": .array([.object(refreshed)])]
+            }
+            await store.confirmApproval(shown, decision: "approve")
+            try expect(network.calls.count == 1 && network.reservedCalls.isEmpty, "An obsolete approval was reserved or submitted")
+            try expect(store.error != nil, "Changed approval failed without explaining that it needs re-reading")
+        }
+    }
+
+    static func unchangedApprovalIsRevalidated() async throws {
+        seed("approval-revalidated")
+        let store = WorkspaceStore()
+        await store.refresh()
+        let shown = approvalFixture()
+        network.executeHandler = { _, call in
+            if call.method == .collaborationState {
+                return ["pending_confirmations": .array([.object(shown)])]
+            }
+            try expect(call.method == .approvalRespond && call.params == ["approval_id": .string("approval-1"), "decision": .string("approve")], "Approval write did not preserve the exact decision and immutable subject")
+            return ["approval_id": .string("approval-1"), "decision": .string("allow"), "status": .string("approved_once")]
+        }
+        await store.confirmApproval(shown, decision: "approve")
+        try expect(network.calls.map(\.method) == [.collaborationState, .approvalRespond], "Approval was submitted before re-reading its current question")
+        try expect(network.reservedCalls.count == 1 && network.reservedCalls.first?.method == .approvalRespond, "Approval read was incorrectly reserved as a business mutation")
+    }
+
+    static func accountChangesDuringReservation() async throws {
+        seed("reservation-account")
+        let store = WorkspaceStore()
+        await store.refresh()
+        let gate = Gate()
+        network.reserveHandler = { _, call, conversation in
+            await gate.wait()
+            return WorkspaceOperation(call: call, conversationId: conversation)
+        }
+        let writing = Task { await store.performAction(.inboxMarkRead, params: ["message_id": .string("message-1")]) }
+        try await gate.waitUntilEntered()
+        network.currentUser = SessionUser(id: "next-account", email: "next@example.com")
+        let requestCount = network.requests.count
+        gate.release()
+        await writing.value
+        try expect(network.calls.isEmpty && network.requests.count == requestCount, "An obsolete account's reserved operation was sent under the new account")
+    }
+
+    static func accountChangesDuringMutation() async throws {
+        seed("mutation-account")
+        let store = WorkspaceStore()
+        await store.refresh()
+        let gate = Gate()
+        network.executeHandler = { _, _ in await gate.wait(); return ["message_id": .string("message-1"), "status": .string("read")] }
+        let writing = Task { await store.performAction(.inboxMarkRead, params: ["message_id": .string("message-1")]) }
+        try await gate.waitUntilEntered()
+        network.currentUser = SessionUser(id: "next-account", email: "next@example.com")
+        let requestCount = network.requests.count
+        gate.release()
+        await writing.value
+        try expect(network.requests.count == requestCount, "An old mutation updated the new account's ledger or refreshed its content")
+        try expect(!store.canAct(.inboxMarkRead), "An obsolete store still permits mutation actions")
+    }
+
+    static func hiddenRecordFiltering() async throws {
+        seed("hidden-records")
+        let contacts: [RemoteRecord] = [
+            ["contact_id": .string("hidden-contact"), "urn": .string("urn:agent:hidden")],
+            ["contact_id": .string("shown-contact"), "urn": .string("urn:agent:shown")]
+        ]
+        network.workspaces["a"]?.snapshots["contacts.list"] = WorkspaceSnapshot(data: ["contacts": .array(contacts.map(JSONValue.object))], time: 200)
+        network.workspaces["a"]?.recordStates = [
+            WorkspaceRecordState(kind: "contact", id: "hidden-contact", deleted: true),
+            WorkspaceRecordState(kind: "collaboration", id: "task-1", deleted: true, relatedIds: ["collaboration-1"])
+        ]
+        let store = WorkspaceStore()
+        await store.refresh()
+        try expect(store.contacts.map { $0.string("contact_id") } == ["shown-contact"], "Hidden contact remained selectable")
+        try expect(store.isRecordHidden(kind: "collaboration", id: "collaboration-1"), "Related collaboration ID bypassed its hidden task state")
+        try expect(!store.isRecordHidden(kind: "contact", id: "task-1"), "A hidden state affected a different record kind")
+        network.workspaces["a"]?.recordStates?[0].deleted = false
+        await store.refresh()
+        try expect(store.contacts.count == 2 && !store.isRecordHidden(kind: "contact", id: "hidden-contact"), "Restored account record stayed hidden")
+    }
+
+    static func combinedSnapshotPrecedence() async throws {
+        seed("snapshot-precedence")
+        let old: RemoteRecord = ["contact_id": .string("old-contact")]
+        let fresh: RemoteRecord = ["contact_id": .string("new-contact")]
+        let message: RemoteRecord = ["message_id": .string("new-message"), "text": .string("An authenticated message")]
+        let request: RemoteRecord = ["request_id": .string("new-request"), "status": .string("pending")]
+        network.workspaces["a"]?.snapshots["contacts.list"] = WorkspaceSnapshot(data: ["contacts": .array([.object(old)])], time: 100)
+        network.workspaces["a"]?.snapshots["inbox.list"] = WorkspaceSnapshot(data: ["messages": .array([])], time: 100)
+        network.workspaces["a"]?.snapshots["collaboration.state"] = WorkspaceSnapshot(data: ["contacts": .array([.object(fresh)]), "inbox": .array([.object(message)]), "contact_requests": .array([.object(request)])], time: 200)
+        let store = WorkspaceStore()
+        await store.refresh()
+        try expect(store.contacts.first?.string("contact_id") == "new-contact", "Older standalone contact snapshot hid fresh combined state")
+        try expect(store.inbox.first?.string("message_id") == "new-message", "Combined inbox array was discarded or older standalone inbox won")
+        try expect(store.contactRequests.first?.string("request_id") == "new-request", "Combined contact request state was discarded")
+        network.workspaces["a"]?.snapshots["inbox.list"] = WorkspaceSnapshot(data: ["messages": .array([.object(["message_id": .string("newest-message")])])], time: 300)
+        network.workspaces["a"]?.snapshots["contacts.requests"] = WorkspaceSnapshot(data: ["requests": .array([.object(["request_id": .string("legacy-newest-request")])])], time: 300)
+        await store.refresh()
+        try expect(store.inbox.first?.string("message_id") == "newest-message", "Newer standalone inbox did not replace combined state")
+        try expect(store.contactRequests.first?.string("request_id") == "legacy-newest-request", "Legacy requests list key was not accepted")
+    }
+
+    static func conversationDraftIsolation() async throws {
+        seed("conversation-drafts")
+        let store = WorkspaceStore()
+        await store.refresh()
+        store.draft = "First conversation's unfinished text"
+        store.saveDraft()
+        await store.selectConversation("conversation-b")
+        try expect(store.draft.isEmpty, "Switching conversations leaked another conversation's text")
+        store.draft = "Second conversation's unfinished text"
+        store.saveDraft()
+        await store.selectConversation(nil)
+        try expect(store.draft.isEmpty, "New chat reused an existing conversation's draft")
+        store.draft = "Not yet submitted new conversation"
+        store.saveDraft()
+        await store.selectConversation("conversation-a")
+        try expect(store.draft == "First conversation's unfinished text", "Original conversation draft was not restored")
+        await store.selectConversation("conversation-b")
+        try expect(store.draft == "Second conversation's unfinished text", "Second conversation draft was overwritten")
+        await store.selectConversation(nil)
+        try expect(store.draft == "Not yet submitted new conversation", "New conversation draft was not independently retained")
+        await store.selectConversation("conversation-a")
+        let restarted = WorkspaceStore()
+        await restarted.refresh()
+        try expect(restarted.conversationID == "conversation-a" && restarted.draft == "First conversation's unfinished text", "Restart did not restore the active conversation's draft")
+    }
+
+    static func savedDraftFallback() async throws {
+        seed("account-draft")
+        network.workspaces["a"]?.activeConversationState = WorkspaceConversationState(draft: "Previously saved on another device")
+        let store = WorkspaceStore()
+        await store.refresh()
+        try expect(store.draft == "Previously saved on another device", "An account draft was not restored without a local edit")
+        store.draft = "This device's unsynchronized edit"
+        store.saveDraft()
+        network.workspaces["a"]?.activeConversationState?.draft = "A delayed account draft"
+        await store.refresh()
+        try expect(store.draft == "This device's unsynchronized edit", "Polling replaced an unsynchronized edit with an account snapshot")
+        let restarted = WorkspaceStore()
+        await restarted.refresh()
+        try expect(restarted.draft == "This device's unsynchronized edit", "Restart discarded an unsynchronized local edit")
+    }
+
+    static func delayedPolicyReadAfterResume() async throws {
+        seed("policy-ordering")
+        let outdated: RemoteRecord = ["status": .string("legacy"), "paused": .bool(true), "can_use_workbench": .bool(false)]
+        let gate = Gate()
+        network.policyHandler = { await gate.wait(); return outdated }
+        let store = WorkspaceStore()
+        let reading = Task { await store.refresh() }
+        try await gate.waitUntilEntered()
+        await store.changePolicy("resume")
+        try expect(store.policyAccess, "Explicit resume did not enable current policy access")
+        gate.release()
+        await reading.value
+        try expect(store.policyAccess && store.policy?.bool("paused") == false, "An older GET reversed the successful explicit resume")
+    }
+
+    static func unresolvedCollaborationBlocksOtherActions() async throws {
+        seed("collaboration-unknown")
+        let original = PendingCall(method: .collaborationExecute, params: ["action": .string("dispatch"), "operation_id": .string("operation-1")])
+        let saved = WorkspaceOperation(call: original, phase: "uncertain", retryable: true, createdAt: Date().timeIntervalSince1970 * 1000)
+        network.workspaces["a"]?.operations = [saved]
+        let store = WorkspaceStore()
+        await store.refresh()
+        await store.performAction(.collaborationExecute, params: ["action": .string("pause_worker"), "task_id": .string("task-1")])
+        try expect(network.calls.isEmpty && network.reservedCalls.isEmpty, "A different collaboration action bypassed the unresolved business write")
+        network.executeHandler = { _, call in
+            try expect(call == original, "Explicit retry altered the original unknown collaboration request")
+            return ["status": .string("uncertain")]
+        }
+        await store.retryAction(saved)
+        try expect(network.calls.count == 1 && network.reservedCalls.first == original, "The original retry was blocked or changed while another action was prevented")
+    }
+
+    static func draftEntries() -> [Data] { SecureStore.memory.filter { $0.key.contains(":draft.") }.map(\.value) }
+
+    static func confirmedDraftReleasesLocalOverride() async throws {
+        seed("confirmed-draft")
+        let store = WorkspaceStore()
+        await store.refresh()
+        store.draft = "Now saved in the account"
+        store.saveDraft()
+        await store.syncDraft()
+        try expect(draftEntries().isEmpty, "A confirmed draft remained a permanent local override")
+        network.workspaces["a"]?.activeConversationState?.draft = "Updated later on another device"
+        let restarted = WorkspaceStore()
+        await restarted.refresh()
+        try expect(restarted.draft == "Updated later on another device", "A stale confirmed local draft replaced newer account content")
+    }
+
+    static func editingDuringDraftSave() async throws {
+        seed("draft-save-edit")
+        let store = WorkspaceStore()
+        await store.refresh()
+        store.draft = "First saved version"
+        store.saveDraft()
+        let gate = Gate()
+        network.conversationUpdateHandler = { id, _, patch in
+            await gate.wait()
+            network.workspaces[id]?.activeConversationState = WorkspaceConversationState(draft: patch.string("draft"))
+            return ["state": .object(patch)]
+        }
+        let saving = Task { await store.syncDraft() }
+        try await gate.waitUntilEntered()
+        store.draft = "A newer local edit"
+        store.saveDraft()
+        gate.release()
+        await saving.value
+        try expect(store.draft == "A newer local edit", "An earlier save acknowledgement replaced newer input")
+        try expect(draftEntries().contains(Data("A newer local edit".utf8)), "An earlier acknowledgement erased the newer recovery draft")
+        let restarted = WorkspaceStore()
+        await restarted.refresh()
+        try expect(restarted.draft == "A newer local edit", "Restart lost the draft edited during the save")
+    }
+
+    static func accountChangesDuringDraftSave() async throws {
+        seed("draft-save-account")
+        let store = WorkspaceStore()
+        await store.refresh()
+        store.draft = "Previous account's local recovery"
+        store.saveDraft()
+        let gate = Gate()
+        network.conversationUpdateHandler = { _, _, patch in await gate.wait(); return ["state": .object(patch)] }
+        let saving = Task { await store.syncDraft() }
+        try await gate.waitUntilEntered()
+        network.currentUser = SessionUser(id: "next-account", email: "next@example.com")
+        let requestCount = network.requests.count
+        gate.release()
+        await saving.value
+        try expect(network.requests.count == requestCount, "Previous draft save issued requests in the new account")
+        try expect(draftEntries().contains(Data("Previous account's local recovery".utf8)), "An obsolete acknowledgement erased the previous account's recovery")
+    }
+
+    static func newConversationAccountDraft() async throws {
+        seed("new-account-draft")
+        network.workspaces["a"]?.activeConversationId = ""
+        network.workspaces["a"]?.conversation = nil
+        network.workspaces["a"]?.activeConversationState = WorkspaceConversationState(draft: "The unsent account draft")
+        let store = WorkspaceStore()
+        await store.refresh()
+        try expect(store.conversationID.isEmpty && store.draft == "The unsent account draft", "A new-chat account draft was lost before an ID existed")
+        try expect(store.canSubmit, "Hydrated new-chat draft is incorrectly prevented from sending")
+        try expect(network.calls.isEmpty, "Restoring an account draft automatically sent it")
+    }
+
+    static func clearedDraftSurvivesSwitch() async throws {
+        seed("cleared-draft")
+        network.workspaces["a"]?.activeConversationState = WorkspaceConversationState(draft: "Text the user chose to clear")
+        let store = WorkspaceStore()
+        await store.refresh()
+        store.draft = ""
+        store.saveDraft()
+        network.conversationUpdateHandler = { _, _, _ in throw URLError(.notConnectedToInternet) }
+        await store.selectConversation("conversation-b")
+        await store.selectConversation("conversation-a")
+        try expect(store.draft.isEmpty, "A failed empty-draft save restored text that the user had cleared")
+        let restarted = WorkspaceStore()
+        await restarted.refresh()
+        try expect(restarted.draft.isEmpty, "Restart lost the local empty-draft tombstone")
+    }
+
+    static func draftSaveQueuePreservesOrder() async throws {
+        seed("draft-save-queue")
+        let store = WorkspaceStore()
+        await store.refresh()
+        let gate = Gate()
+        var sentTexts: [String] = []
+        network.conversationUpdateHandler = { id, conversation, patch in
+            let text = patch.string("draft")
+            sentTexts.append(text)
+            if sentTexts.count == 1 { await gate.wait() }
+            network.conversationStates[id, default: [:]][conversation ?? ""] = WorkspaceConversationState(draft: text)
+            network.workspaces[id]?.activeConversationState = WorkspaceConversationState(draft: text)
+            return ["state": .object(patch)]
+        }
+        store.draft = "Older save"
+        store.saveDraft()
+        let first = Task { await store.syncDraft() }
+        try await gate.waitUntilEntered()
+        first.cancel()
+        store.draft = "Newer save"
+        store.saveDraft()
+        var secondStarted = false
+        let second = Task { secondStarted = true; await store.syncDraft() }
+        for _ in 0..<100 where !secondStarted { await Task.yield() }
+        for _ in 0..<10 { await Task.yield() }
+        let sentBeforeRelease = sentTexts
+        gate.release()
+        await first.value
+        await second.value
+        try expect(secondStarted && sentBeforeRelease == ["Older save"], "A newer save raced an older request still able to commit")
+        try expect(sentTexts == ["Older save", "Newer save"], "Cancelled view task discarded a save or reordered account writes")
+        try expect(network.workspaces["a"]?.activeConversationState?.draft == "Newer save", "The account finished with the older draft")
+    }
+
+    static func foreignSubmissionPreservesScopedDraft() async throws {
+        seed("foreign-send-draft")
+        let store = WorkspaceStore()
+        await store.refresh()
+        store.draft = "Unfinished original conversation"
+        store.saveDraft()
+        let foreign = newerRemoteSubmission()
+        network.workspaces["a"]?.submission = foreign
+        network.workspaces["a"]?.activeConversationId = foreign.conversationId
+        network.workspaces["a"]?.conversation = nil
+        network.workspaces["a"]?.activeConversationState = WorkspaceConversationState(draft: "Other conversation's saved draft")
+        await store.refresh()
+        try expect(store.submission?.call == foreign.call && store.conversationID == foreign.conversationId, "Foreign unresolved send was not restored")
+        try expect(store.draft != "Unfinished original conversation", "Original conversation's text leaked into the foreign send")
+        let updatesBefore = network.requests.filter { $0.method == "conversation-update" }.count
+        await store.syncDraft()
+        try expect(network.requests.filter { $0.method == "conversation-update" }.count == updatesBefore, "Unhydrated foreign context overwrote an account draft")
+        network.workspaces["a"]?.submission = nil
+        network.workspaces["a"]?.conversation = ["conversation_id": .string(foreign.conversationId), "turns": .array([.object(turn(foreign.turnId, time: 20, status: "completed"))])]
+        await store.refresh()
+        try expect(store.submission == nil && store.draft == "Other conversation's saved draft", "A resolved foreign send did not hydrate its own account draft")
+        await store.selectConversation("conversation-a")
+        try expect(store.draft == "Unfinished original conversation", "Foreign recovery discarded the original scoped draft")
+    }
+
+    static func remotelyDeletedConversation() async throws {
+        seed("remote-deletion")
+        savedHistoryFixture()
+        let store = WorkspaceStore()
+        await store.refresh()
+        store.focusTurnID = "saved-terminal-turn"
+        network.workspaces["a"]?.activeConversationState = WorkspaceConversationState(deleted: true)
+        await store.refresh()
+        try expect(store.conversationID.isEmpty && store.turns.isEmpty && store.focusTurnID == nil, "Authoritative deletion preserved or resurrected a cached transcript")
+    }
+
+    static func legacyDraftMigration() async throws {
+        seed("legacy-draft")
+        let scope = network.baseUrl + "\u{0}" + (network.currentUser?.id ?? "")
+        let hash = SHA256.hash(data: Data(scope.utf8)).map { String(format: "%02x", $0) }.joined()
+        let journal = SecureStore(namespace: "agent-workspace." + hash)
+        try journal.set(Data("An existing release's unfinished draft".utf8), for: "draft.a")
+        let store = WorkspaceStore()
+        await store.refresh()
+        try expect(store.draft == "An existing release's unfinished draft", "Upgrade discarded a legacy local draft")
+        let legacyValue = try journal.data(key: "draft.a")
+        let scopedValue = try journal.data(key: "draft.a.conversation-a")
+        try expect(legacyValue == nil, "Legacy draft was not moved out of the unscoped slot")
+        try expect(scopedValue == Data("An existing release's unfinished draft".utf8), "Legacy draft was not migrated to the saved active conversation")
     }
 
     static func required<T>(_ value: T?, _ message: String) throws -> T {

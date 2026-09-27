@@ -64,7 +64,7 @@ struct PairingView: View {
                         Divider()
                         VStack(alignment: .leading, spacing: 10) {
                             Label("3 · 验证连接", systemImage: "checkmark.shield").font(.subheadline.bold())
-                            Button { Task { await store.invoke(.capabilities) } } label: { Label("检查连接与权限", systemImage: "arrow.triangle.2.circlepath") }.buttonStyle(.borderedProminent).disabled(workspace.identity.virtualUrn == nil || store.busy != nil || store.demo)
+                            Button { Task { await store.invoke(.capabilities) } } label: { Label("检查连接与权限", systemImage: "arrow.triangle.2.circlepath") }.buttonStyle(.borderedProminent).disabled(workspace.identity.virtualUrn == nil || store.busy != nil || store.demo || !store.policyAccess)
                             if let capabilities = store.capabilities {
                                 ForEach(Array(capabilities.records("methods").enumerated()), id: \.offset) { _, method in
                                     HStack(alignment: .top) {
@@ -100,6 +100,6 @@ struct PairingView: View {
         }
     }
     private func methodTitle(_ name: String) -> String {
-        ["capabilities": "检查连接", "contacts.list": "联系人", "collaboration.state": "协作进展", "inbox.list": "收件箱", "conversation.send": "发送消息", "conversation.get": "读取对话", "approval.respond": "远程确认（请在原生渠道处理）"][name] ?? name
+        ["capabilities": "检查连接", "contacts.list": "联系人", "collaboration.state": "协作进展", "inbox.list": "收件箱", "conversation.send": "发送对话", "conversation.get": "读取对话", "approval.respond": "回应确认请求", "contacts.add": "申请好友", "contacts.requests": "读取好友请求", "contacts.respond": "回应好友请求", "messages.send": "发送联系消息", "inbox.mark_read": "同步消息已读", "attention.list": "读取提醒", "collaboration.execute": "协作操作"][name] ?? name
     }
 }

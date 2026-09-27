@@ -7,6 +7,18 @@ public enum RPCMethod: String, Codable, CaseIterable, Sendable, Hashable {
     case inboxList = "inbox.list"
     case conversationSend = "conversation.send"
     case conversationGet = "conversation.get"
+    case attentionList = "attention.list"
+    case contactsAdd = "contacts.add"
+    case approvalRespond = "approval.respond"
+    case contactsRequests = "contacts.requests"
+    case contactsRespond = "contacts.respond"
+    case messagesSend = "messages.send"
+    case inboxMarkRead = "inbox.mark_read"
+    case collaborationExecute = "collaboration.execute"
+
+    public var isWrite: Bool {
+        [.conversationSend, .contactsAdd, .approvalRespond, .contactsRespond, .messagesSend, .inboxMarkRead, .collaborationExecute].contains(self)
+    }
 }
 
 public struct PendingCall: Codable, Sendable, Hashable {
@@ -17,6 +29,9 @@ public struct PendingCall: Codable, Sendable, Hashable {
     public init(requestId: String = UUID().uuidString.lowercased(), method: RPCMethod, params: RemoteRecord = [:]) {
         self.requestId = requestId; self.method = method; self.params = params
     }
+    /// Describe is the only read-only collaboration.execute action.
+    public var isWrite: Bool { method.isWrite && !(method == .collaborationExecute && params.string("action") == "describe") }
+    public var requiresOperationRecord: Bool { isWrite && method != .conversationSend }
 }
 
 public struct SessionUser: Codable, Sendable, Hashable, Identifiable {
@@ -63,7 +78,10 @@ public struct WorkspaceSnapshot: Codable, Sendable, Hashable {
     public var data: RemoteRecord
     public var time: Double
     public var requestId: String?
-    public init(data: RemoteRecord, time: Double, requestId: String? = nil) { self.data = data; self.time = time; self.requestId = requestId }
+    public var sourceAt: Double?
+    public init(data: RemoteRecord, time: Double, requestId: String? = nil, sourceAt: Double? = nil) {
+        self.data = data; self.time = time; self.requestId = requestId; self.sourceAt = sourceAt
+    }
 }
 
 public struct WorkspaceConversation: Codable, Sendable, Hashable, Identifiable {
@@ -72,8 +90,14 @@ public struct WorkspaceConversation: Codable, Sendable, Hashable, Identifiable {
     public var updatedAt: Double
     public var pending: Bool
     public var turnCount: Int
-    public init(id: String, title: String, updatedAt: Double = 0, pending: Bool = false, turnCount: Int = 0) {
+    public var archived: Bool?
+    public var deleted: Bool?
+    public var unread: Bool?
+    public var readAt: Double?
+    public init(id: String, title: String, updatedAt: Double = 0, pending: Bool = false, turnCount: Int = 0,
+                archived: Bool? = nil, deleted: Bool? = nil, unread: Bool? = nil, readAt: Double? = nil) {
         self.id = id; self.title = title; self.updatedAt = updatedAt; self.pending = pending; self.turnCount = turnCount
+        self.archived = archived; self.deleted = deleted; self.unread = unread; self.readAt = readAt
     }
 }
 
@@ -99,14 +123,22 @@ public struct WorkspaceAgent: Codable, Sendable, Hashable {
     public var conversation: RemoteRecord?
     public var hasEarlierTurns: Bool
     public var submission: WorkspaceSubmission?
-    public init(agent: WorkspaceConnection, identity: WorkspaceIdentity = .init(), sync: WorkspaceSync = .init(), snapshots: [String: WorkspaceSnapshot] = [:], conversations: [WorkspaceConversation] = [], activeConversationId: String = "", conversation: RemoteRecord? = nil, hasEarlierTurns: Bool = false, submission: WorkspaceSubmission? = nil) {
+    public var operations: [WorkspaceOperation]?
+    public var recordStates: [WorkspaceRecordState]?
+    public var activeConversationState: WorkspaceConversationState?
+    public init(agent: WorkspaceConnection, identity: WorkspaceIdentity = .init(), sync: WorkspaceSync = .init(), snapshots: [String: WorkspaceSnapshot] = [:], conversations: [WorkspaceConversation] = [], activeConversationId: String = "", conversation: RemoteRecord? = nil, hasEarlierTurns: Bool = false, submission: WorkspaceSubmission? = nil,
+                operations: [WorkspaceOperation]? = nil, recordStates: [WorkspaceRecordState]? = nil, activeConversationState: WorkspaceConversationState? = nil) {
         self.agent = agent; self.identity = identity; self.sync = sync; self.snapshots = snapshots; self.conversations = conversations; self.activeConversationId = activeConversationId; self.conversation = conversation; self.hasEarlierTurns = hasEarlierTurns; self.submission = submission
+        self.operations = operations; self.recordStates = recordStates; self.activeConversationState = activeConversationState
     }
 }
 
 public struct WorkspaceOverview: Codable, Sendable, Hashable {
     public var connections: [WorkspaceConnection]
-    public init(connections: [WorkspaceConnection]) { self.connections = connections }
+    public var notifications: WorkspaceNotificationCounts?
+    public init(connections: [WorkspaceConnection], notifications: WorkspaceNotificationCounts? = nil) {
+        self.connections = connections; self.notifications = notifications
+    }
 }
 
 /// Delayed snapshots cannot overwrite a newer saved result.
@@ -135,7 +167,7 @@ public func mergeTurns(earlier: [RemoteRecord], latest: [RemoteRecord]) -> [Remo
 }
 
 public func pairingAllowsSend(capabilities: RemoteRecord?, sync: WorkspaceSync, now: Date = Date()) -> Bool {
-    guard sync.status != "needs_pairing" else { return false }
+    guard !["needs_pairing", "policy_paused", "policy_unavailable"].contains(sync.status) else { return false }
     guard let expiry = capabilities?.record("pairing")["expires_at"], expiry != .null else { return true }
     if let value = expiry.numberValue {
         let seconds = value < 1_000_000_000_000 ? value : value / 1000

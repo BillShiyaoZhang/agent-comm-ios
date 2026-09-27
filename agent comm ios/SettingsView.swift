@@ -33,6 +33,7 @@ struct SettingsView: View {
                         }
                     }
                     .padding(.vertical, 6)
+                    if networkManager.isAuthenticated { NavigationLink("账户与安全") { AccountSecurityView() } }
                 }
 
                 Section {
@@ -85,7 +86,7 @@ struct SettingsView: View {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("本地智能体的访问权限")
                                 .font(.subheadline.weight(.semibold))
-                            Text("在 Agent 本机配对控制台身份；保存连接不会自动授予权限。联系人、对话和协作数据按本机授权范围同步。需要确认的操作请回原生渠道回应。")
+                            Text("通过一次性连接链接或在 Agent 本机配对控制台身份。保存地址不会自动授予权限；好友、消息和协作确认等操作按本机授权范围开放。")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }

@@ -21,13 +21,13 @@ struct SyncStatusView: View {
     }
 }
 func syncText(_ status: String) -> String {
-    switch status { case "ready": return "已同步"; case "syncing": return "正在同步"; case "offline": return "暂未连接 · 保留已同步内容"; case "needs_pairing": return "需要本机配对"; default: return "等待同步" }
+    switch status { case "ready": return "已同步"; case "syncing": return "正在同步"; case "offline": return "暂未连接 · 保留已同步内容"; case "needs_pairing": return "需要本机配对"; case "policy_paused": return "政策待确认或同步已暂停"; case "policy_unavailable": return "政策或托管授权暂不可用"; default: return "等待同步" }
 }
 func syncIcon(_ status: String) -> String {
-    switch status { case "ready": return "checkmark.circle.fill"; case "syncing": return "arrow.triangle.2.circlepath"; case "offline": return "wifi.slash"; case "needs_pairing": return "key.fill"; default: return "clock" }
+    switch status { case "ready": return "checkmark.circle.fill"; case "syncing": return "arrow.triangle.2.circlepath"; case "offline": return "wifi.slash"; case "needs_pairing": return "key.fill"; case "policy_paused", "policy_unavailable": return "hand.raised.fill"; default: return "clock" }
 }
 func syncColor(_ status: String) -> Color {
-    switch status { case "ready": return .statusSuccess; case "offline", "needs_pairing": return .statusWarning; default: return .secondary }
+    switch status { case "ready": return .statusSuccess; case "offline", "needs_pairing", "policy_paused", "policy_unavailable": return .statusWarning; default: return .secondary }
 }
 func remoteDate(_ value: JSONValue?) -> String {
     guard let value else { return "" }
@@ -42,13 +42,13 @@ func remoteDate(_ value: JSONValue?) -> String {
     return date?.formatted(date: .abbreviated, time: .shortened) ?? ""
 }
 func stateText(_ status: String) -> String {
-    ["submitted": "等待处理", "running": "处理中", "completed": "本回合已完成", "failed": "处理失败", "interrupted": "结果待核实", "pending": "待确认", "presenting": "等待本机确认", "expired": "已过期", "active": "已授权", "revoked": "已撤销", "ready": "准备发送", "sending": "正在投递", "accepted": "本机队列已接收", "awaiting_approval": "待确认", "denied": "已拒绝", "approved": "已确认"][status] ?? (status.isEmpty ? "状态未知" : status)
+    ["submitted": "等待处理", "running": "处理中", "completed": "本回合已完成", "failed": "处理失败", "interrupted": "结果待核实", "pending": "待确认", "presenting": "等待本机确认", "expired": "已过期", "active": "已授权", "revoked": "已撤销", "ready": "准备发送", "sending": "正在投递", "accepted": "本机队列已接收", "awaiting_approval": "待确认", "denied": "已拒绝", "approved": "已确认", "open": "待处理", "resolved": "已处理", "superseded": "已更新"][status] ?? (status.isEmpty ? "状态未知" : status)
 }
 struct RemoteStatus: View {
     let status: String
     var body: some View { StatusBadge(text: stateText(status), color: color) }
     private var color: Color {
-        if ["completed", "active", "approved"].contains(status) { return .statusSuccess }
+        if ["completed", "active", "approved", "resolved"].contains(status) { return .statusSuccess }
         if ["failed", "interrupted", "denied", "revoked", "expired"].contains(status) { return .statusDestructive }
         return .statusWarning
     }
@@ -58,11 +58,13 @@ struct WorkspaceFeedback: View {
     var body: some View {
         VStack(spacing: 8) {
             if store.demo { InlineNotice(message: "界面演示 · 使用示例数据", style: .info) }
+            PolicyDisclosureView()
             if let message = store.connectionError { InlineNotice(message: message, style: .error) }
             if let error = store.error {
                 InlineNotice(message: error, style: .error)
                 Button("重新连接") { Task { await store.refresh(schedule: true) } }.font(.subheadline).disabled(store.busy != nil)
             }
+            if let result = store.actionResult { InlineNotice(message: result, style: .info) }
             if store.busy != nil { ProgressView(store.busy == "conversation.send" ? "等待 Agent 受理…" : "正在更新…").font(.caption).frame(maxWidth: .infinity, alignment: .leading) }
         }
     }

@@ -21,7 +21,7 @@ struct RegisterView: View {
                 if didRegister {
                     WorkspaceCard {
                         VStack(spacing: 20) {
-                            EmptyState(title: "账户已创建", message: "请使用新账户登录这个工作区。", systemImage: "checkmark.circle")
+                            EmptyState(title: "请检查验证邮件", message: "若该邮箱可以注册，工作区会发送验证邮件。完成邮箱验证后再登录；已有账户可直接登录。", systemImage: "envelope.badge")
                             Button("返回登录") { dismiss() }
                                 .buttonStyle(WorkspacePrimaryButtonStyle())
                         }

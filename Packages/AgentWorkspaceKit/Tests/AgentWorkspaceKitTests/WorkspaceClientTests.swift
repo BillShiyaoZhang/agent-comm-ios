@@ -267,6 +267,176 @@ final class WorkspaceClientTests: XCTestCase {
             XCTAssertEqual(actual, vector.bool("allowed"), "\(vector)")
         }
     }
+
+    func testCurrentRPCMethodsAndPolicyPausedPairingRules() throws {
+        XCTAssertEqual(RPCMethod.allCases.count, 14)
+        for method in RPCMethod.allCases {
+            let call = PendingCall(requestId: requestId, method: method, params: ["text": "当前合同"])
+            XCTAssertEqual(try JSONDecoder().decode(PendingCall.self, from: call.encodeRequestBody()), call)
+        }
+        XCTAssertFalse(PendingCall(method: .collaborationExecute, params: ["action": "describe"]).isWrite)
+        XCTAssertTrue(PendingCall(method: .collaborationExecute, params: ["action": "advance"]).requiresOperationRecord)
+        XCTAssertFalse(PendingCall(method: .conversationSend).requiresOperationRecord)
+        for status in ["policy_paused", "policy_unavailable"] {
+            XCTAssertFalse(pairingAllowsSend(capabilities: nil, sync: .init(status: status)))
+        }
+        XCTAssertEqual(availableMethods(capabilities: ["methods": [["name": "contacts.add", "available": true], ["name": "future.write", "available": true], ["name": "approval.respond", "available": false]]]), [.contactsAdd])
+    }
+
+    func testAttentionFixtureValidationRejectsUnsafeCursorAndConversationTargets() throws {
+        for name in ["attention-page", "attention-conversation-page"] {
+            let page = try JSONDecoder().decode(RemoteRecord.self, from: fixture(name))
+            XCTAssertEqual(try validateAttentionPage(page), page)
+        }
+        var page = try JSONDecoder().decode(RemoteRecord.self, from: fixture("attention-conversation-page"))
+        var item = try XCTUnwrap(page.records("items").first)
+        item["unknown_extension"] = ["future": true]
+        page["items"] = .array([.object(item)])
+        XCTAssertEqual(try validateAttentionPage(page).records("items").first?["unknown_extension"], item["unknown_extension"])
+        let valid = page
+        for cursor in [JSONValue.number(-1), .number(7.5), .number(9_007_199_254_740_992)] {
+            page["cursor"] = cursor
+            XCTAssertThrowsError(try validateAttentionPage(page))
+        }
+        page = valid
+        item["target"] = ["kind": "conversation", "id": "chat-1"]
+        page["items"] = .array([.object(item)])
+        XCTAssertThrowsError(try validateAttentionPage(page))
+        page = valid
+        page["items"] = .array([valid["items"]!.arrayValue![0], valid["items"]!.arrayValue![0]])
+        XCTAssertThrowsError(try validateAttentionPage(page))
+        XCTAssertTrue(attentionRequiresAction(kind: "friend_request_received", state: "open"))
+        XCTAssertFalse(attentionRequiresAction(kind: "conversation_completed", state: "open"))
+    }
+
+    func testNewWorkspaceMetadataAndOperationJournalDecodeWithoutChangingOldFixtures() throws {
+        var body = try JSONDecoder().decode(RemoteRecord.self, from: fixture("workspace-agent"))
+        let call = PendingCall(requestId: requestId, method: .messagesSend, params: ["message_id": "message-2", "text": "你好"])
+        let operation = WorkspaceOperation(call: call, phase: "uncertain", message: "请核实", retryable: false, result: ["source": "authenticated_snapshot"], conversationId: "chat-1", createdAt: 100, updatedAt: 200)
+        let state = WorkspaceConversationState(title: "已改名", archived: true, deleted: false, readAt: 100, draft: "草稿")
+        let recordState = WorkspaceRecordState(kind: "contact", id: "alice", deleted: true, updatedAt: 200, title: "Alice", relatedIds: ["urn:hermes:agent:ALICE"])
+        let encoder = JSONEncoder(), decoder = JSONDecoder()
+        body["operations"] = try decoder.decode(JSONValue.self, from: encoder.encode([operation]))
+        body["activeConversationState"] = try decoder.decode(JSONValue.self, from: encoder.encode(state))
+        body["recordStates"] = try decoder.decode(JSONValue.self, from: encoder.encode([recordState]))
+        let decoded = try decoder.decode(WorkspaceAgent.self, from: encoder.encode(body))
+        XCTAssertEqual(decoded.operations, [operation])
+        XCTAssertEqual(decoded.activeConversationState, state)
+        XCTAssertEqual(decoded.recordStates, [recordState])
+        XCTAssertEqual(try decoder.decode(WorkspaceAgent.self, from: encoder.encode(decoded)), decoded)
+        let provenance: RemoteRecord = ["source_context": ["origin": "paired_conversation", "conversation_id": "chat-1", "turn_id": "turn-2"]]
+        XCTAssertEqual(sourceConversation(provenance)?.conversationId, "chat-1")
+        XCTAssertNil(sourceConversation(["source_context": ["origin": "untrusted", "conversation_id": "chat-1"]]))
+    }
+
+    func testEveryWriteRetainsUncertaintyForUnknownAuthenticatedErrors() async throws {
+        for method in RPCMethod.allCases where method.isWrite {
+            var body = try JSONDecoder().decode(RemoteRecord.self, from: fixture("control-pairing-error"))
+            var response = body.record("response")
+            response["method"] = .string(method.rawValue)
+            response["error"] = ["code": "result_too_large", "message": "响应太大"]
+            body["response"] = .object(response)
+            let encoded = try JSONEncoder().encode(body)
+            StubProtocol.respond { _ in (200, [:], encoded) }
+            let call = PendingCall(requestId: requestId, method: method)
+            do { _ = try await client().execute(agentId: "agent-a", call: call); XCTFail("Unknown error accepted") }
+            catch let error as ControlCallError {
+                XCTAssertTrue(error.uncertain, method.rawValue)
+                XCTAssertFalse(error.retryable)
+                XCTAssertEqual(error.call, call)
+            }
+        }
+    }
+
+    func testDescribeDoesNotBecomeAnUncertainBusinessWrite() async throws {
+        StubProtocol.respond { _ in (503, [:], Data("{\"error\":\"offline\"}".utf8)) }
+        let call = PendingCall(requestId: requestId, method: .collaborationExecute, params: ["action": "describe"])
+        do { _ = try await client().execute(agentId: "agent-a", call: call); XCTFail("Failure accepted") }
+        catch let error as ControlCallError { XCTAssertFalse(error.uncertain); XCTAssertTrue(error.retryable) }
+    }
+
+    func testEmailVerificationErrorsSurviveBothNextAuthCallbackFormats() async throws {
+        for status in [200, 401] {
+            StubProtocol.respond { request in
+                if request.url?.path == "/api/auth/csrf" { return (200, [:], Data("{\"csrfToken\":\"csrf\"}".utf8)) }
+                return (status, [:], Data("{\"url\":\"https://workspace.example/api/auth/error?error=EmailNotVerified\"}".utf8))
+            }
+            do { _ = try await client().login(email: "user@example.com", password: "password"); XCTFail("Unverified login accepted") }
+            catch WorkspaceClientError.emailNotVerified { }
+        }
+    }
+
+    func testPolicyAndNotificationRequestsUseDisplayedHashAndRevision() async throws {
+        StubProtocol.respond { _ in (200, [:], Data("{\"saved\":true,\"paused\":true}".utf8)) }
+        let api = try client(), hash = String(repeating: "a", count: 64)
+        _ = try await api.fetchPolicy()
+        _ = try await api.updatePolicy(["policy_hash": .string(hash), "confirm": true])
+        _ = try await api.updatePolicy(["resume": true])
+        try await api.pausePolicy()
+        _ = try await api.fetchNotifications(filter: "pending", before: 123)
+        try await api.markNotificationRead(agentId: "agent-a", id: hash, revision: 7)
+        let requests = StubProtocol.requests
+        XCTAssertEqual(requests.map { $0.url!.path }, ["/api/platform-policy", "/api/platform-policy", "/api/platform-policy", "/api/platform-policy", "/api/notifications", "/api/notifications"])
+        XCTAssertEqual(requests.map(\.httpMethod), ["GET", "POST", "POST", "DELETE", "GET", "POST"])
+        XCTAssertEqual(URLComponents(url: requests[4].url!, resolvingAgainstBaseURL: false)?.queryItems, [URLQueryItem(name: "filter", value: "pending"), URLQueryItem(name: "before", value: "123")])
+        let body = try JSONDecoder().decode(RemoteRecord.self, from: XCTUnwrap(requests[5].httpBody))
+        XCTAssertEqual(body.string("id"), hash)
+        XCTAssertEqual(body.number("revision"), 7)
+        XCTAssertTrue(requests.filter { $0.httpMethod != "GET" }.allSatisfy { $0.value(forHTTPHeaderField: "Origin") == "https://workspace.example" })
+        do { _ = try await api.updatePolicy(["policy_hash": "old", "confirm": true]); XCTFail("Invalid hash accepted") } catch { }
+        do { _ = try await api.fetchNotifications(before: 0.5); XCTFail("Fractional cursor accepted") } catch { }
+        XCTAssertEqual(StubProtocol.requests.count, 6)
+    }
+
+    func testOperationReservationPreservesOriginalCallBeforeDeliveryAndValidatesResponse() async throws {
+        let call = PendingCall(requestId: requestId, method: .contactsRespond, params: ["request_id": "friend-1", "decision": "accept"])
+        let operation = WorkspaceOperation(call: call, conversationId: "chat-1", createdAt: 100, updatedAt: 100)
+        let encoded = try JSONEncoder().encode(["item": operation])
+        StubProtocol.respond { request in
+            XCTAssertEqual(request.url?.path, "/api/agents/agent-a/workspace/operations")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Origin"), "https://workspace.example")
+            return (200, [:], encoded)
+        }
+        let api = try client()
+        let reserved = try await api.reserveOperation(agentId: "agent-a", call: call, conversationId: "chat-1")
+        XCTAssertEqual(reserved, operation)
+        let request = try XCTUnwrap(StubProtocol.requests.first)
+        let body = try JSONDecoder().decode(RemoteRecord.self, from: XCTUnwrap(request.httpBody))
+        XCTAssertEqual(body.string("action"), "reserve")
+        XCTAssertEqual(body.string("conversationId"), "chat-1")
+        XCTAssertEqual(try JSONDecoder().decode(PendingCall.self, from: JSONEncoder().encode(body["call"]!)), call)
+        _ = try await api.updateOperation(agentId: "agent-a", requestId: requestId, phase: "uncertain", message: "请核实原请求", retryable: false)
+        let forbidden = PendingCall(method: .collaborationExecute, params: ["action": "describe"])
+        do { _ = try await api.reserveOperation(agentId: "agent-a", call: forbidden); XCTFail("Read reserved as write") } catch { }
+        XCTAssertEqual(StubProtocol.requests.count, 2)
+    }
+
+    func testSavedConversationAccountAndOnboardingRoutes() async throws {
+        StubProtocol.respond { _ in (202, [:], Data("{\"status\":\"accepted\"}".utf8)) }
+        let api = try client(), code = String(repeating: "A", count: 32)
+        _ = try await api.fetchConversations(agentId: "agent-a", query: "设计", archived: "all", deleted: "active", before: "chat-1")
+        _ = try await api.updateConversation(agentId: "agent-a", conversationId: nil, patch: ["draft": "草稿", "scrollTop": .null])
+        _ = try await api.fetchActivity()
+        _ = try await api.fetchAccount()
+        _ = try await api.resendVerification(email: "user@example.com")
+        _ = try await api.requestPasswordReset(email: "user@example.com")
+        _ = try await api.previewOnboarding(code: code)
+        _ = try await api.approveOnboarding(code: code)
+        try await api.renameConnection(agentId: "agent-a", name: " 新名称 ")
+        try await api.removeConnection(agentId: "agent-a")
+        let requests = StubProtocol.requests
+        XCTAssertEqual(requests.count, 10)
+        XCTAssertEqual(requests[7].url?.path, "/api/onboarding/claim/\(code)")
+        XCTAssertEqual(requests[7].httpMethod, "POST")
+        XCTAssertEqual(try JSONDecoder().decode(RemoteRecord.self, from: XCTUnwrap(requests[7].httpBody)), ["confirm": true])
+        let draft = try JSONDecoder().decode(RemoteRecord.self, from: XCTUnwrap(requests[1].httpBody))
+        XCTAssertEqual(draft["conversationId"], .null)
+        XCTAssertEqual(draft.string("draft"), "草稿")
+        XCTAssertEqual(requests[8].httpMethod, "PATCH")
+        XCTAssertEqual(requests[9].httpMethod, "DELETE")
+        do { _ = try await api.previewOnboarding(code: "bad/code"); XCTFail("Invalid code accepted") } catch { }
+        XCTAssertEqual(StubProtocol.requests.count, 10)
+    }
 }
 
 private final class StubProtocol: URLProtocol, @unchecked Sendable {

@@ -4,6 +4,8 @@ struct DashboardView: View {
     @EnvironmentObject private var store: WorkspaceStore
     @State private var showSettings = false
     @State private var showConnect = false
+    @State private var showClaim = false
+    @State private var showManage = false
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -13,10 +15,12 @@ struct DashboardView: View {
                         Text("连接你的 Agent，在这里接续对话、掌握进展。").font(.subheadline).foregroundStyle(.secondary)
                     }.padding(.top, 6)
                     WorkspaceFeedback()
+                    Button { showClaim = true } label: { Label("通过一次性链接连接 Agent", systemImage: "link") }.buttonStyle(.bordered).disabled(store.demo)
                     if store.isLoading { ProgressView("正在读取你的工作空间…").frame(maxWidth: .infinity).padding(40) }
                     else if store.connections.isEmpty { onboarding }
                     else {
                         connectionSection
+                        activitySection
                         if store.workspace != nil { currentWorkspace }
                     }
                 }.padding(20).frame(maxWidth: 920).frame(maxWidth: .infinity)
@@ -25,10 +29,37 @@ struct DashboardView: View {
                 .navigationTitle("工作台")
                 .toolbar {
                     ToolbarItem { Button { showConnect = true } label: { Label("添加连接", systemImage: "plus") }.disabled(store.demo) }
+                    ToolbarItem { Button { showManage = true } label: { Label("管理连接", systemImage: "ellipsis.circle") }.disabled(store.selectedAgentID == nil || store.demo) }
                     ToolbarItem { Button { showSettings = true } label: { Label("设置", systemImage: "gearshape") } }
                 }
                 .sheet(isPresented: $showConnect) { AddConnectionView() }
                 .sheet(isPresented: $showSettings) { SettingsView() }
+                .sheet(isPresented: $showClaim) { OnboardingClaimView() }
+                .sheet(isPresented: $showManage) { ConnectionManagementView() }
+        }
+    }
+    @ViewBuilder private var activitySection: some View {
+        let items = store.activity.records("agents").flatMap { $0.records("items") }
+        if !items.isEmpty {
+            WorkspaceCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("需要关注的进展").font(.headline)
+                    ForEach(Array(items.prefix(8).enumerated()), id: \.offset) { _, item in
+                        Button {
+                            Task {
+                                await store.selectAgent(item.string("agentId"))
+                                if store.selectedAgentID == item.string("agentId") { store.collaborationFocusID = item.string("id"); store.tab = 2 }
+                            }
+                        } label: {
+                            HStack(alignment: .top) {
+                                Image(systemName: item.bool("needsAction") ? "hand.raised" : "arrow.triangle.2.circlepath").foregroundStyle(Color.brandPrimary)
+                                VStack(alignment: .leading, spacing: 4) { Text(item.string("title")).font(.subheadline.bold()); Text(item.string("summary")).font(.caption).foregroundStyle(.secondary); Text(item.string("agentName")).font(.caption2).foregroundStyle(.secondary) }
+                                Spacer(); Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }.buttonStyle(.plain).disabled(store.busy != nil || store.submission != nil || store.demo)
+                    }
+                }
+            }
         }
     }
     private var onboarding: some View {
@@ -82,7 +113,7 @@ struct DashboardView: View {
                         }
                         Divider()
                         if store.pendingCount > 0 {
-                            Label("\(store.pendingCount) 项协作请求等待你在 Agent 原生渠道确认。", systemImage: "hand.raised.fill").font(.subheadline).foregroundStyle(Color.statusWarning)
+                            Label("\(store.pendingCount) 项协作请求等待你核对和决定。", systemImage: "hand.raised.fill").font(.subheadline).foregroundStyle(Color.statusWarning)
                         } else { Text("接续上次的想法，或交给 Agent 一件新任务。").font(.subheadline).foregroundStyle(.secondary) }
                         HStack {
                             Button { store.tab = 1 } label: { Label("继续对话", systemImage: "arrow.up.right.message").frame(maxWidth: .infinity) }.buttonStyle(.borderedProminent)

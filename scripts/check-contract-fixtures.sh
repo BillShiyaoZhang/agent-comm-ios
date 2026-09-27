@@ -17,3 +17,18 @@ done
 for target in "$target_root"/*.json; do
   test -f "$source_root/$(basename "$target")"
 done
+python3 - "$source_root/../index.d.ts" "$repo_root/Packages/AgentWorkspaceKit/Sources/AgentWorkspaceKit/WorkspaceModels.swift" <<'PY'
+import pathlib
+import re
+import sys
+
+contract = pathlib.Path(sys.argv[1]).read_text()
+swift = pathlib.Path(sys.argv[2]).read_text().split("public struct PendingCall", 1)[0]
+methods = re.search(r'RPC_METHODS: readonly \[(.*?)\]', contract).group(1)
+expected = set(re.findall(r'"([a-z._]+)"', methods))
+actual = set(re.findall(r'case \w+ = "([a-z._]+)"', swift))
+actual.add("capabilities")
+if expected != actual:
+    raise SystemExit(f"RPC method mismatch: missing={sorted(expected - actual)} extra={sorted(actual - expected)}")
+print(f"MATCH {len(expected)} RPC methods")
+PY

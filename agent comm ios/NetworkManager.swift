@@ -114,6 +114,45 @@ final class NetworkManager: ObservableObject {
         try await perform { try await $0.dismissSubmission(agentId: agentId, requestId: requestId) }
     }
 
+    func fetchPolicy() async throws -> RemoteRecord { try await perform { try await $0.fetchPolicy() } }
+    func updatePolicy(_ body: RemoteRecord) async throws -> RemoteRecord { try await perform { try await $0.updatePolicy(body) } }
+    func pausePolicy() async throws { _ = try await perform { try await $0.pausePolicy() } }
+    func fetchNotifications(filter: String = "all", before: Double? = nil) async throws -> RemoteRecord {
+        try await perform { try await $0.fetchNotifications(filter: filter, before: before) }
+    }
+    func markNotificationRead(agentId: String, id: String, revision: Int) async throws {
+        try await perform { try await $0.markNotificationRead(agentId: agentId, id: id, revision: revision) }
+    }
+    func fetchOperations(agentId: String) async throws -> [WorkspaceOperation] {
+        try await perform { try await $0.fetchOperations(agentId: agentId) }
+    }
+    func reserveOperation(agentId: String, call: PendingCall, conversationId: String? = nil) async throws -> WorkspaceOperation {
+        try await perform { try await $0.reserveOperation(agentId: agentId, call: call, conversationId: conversationId) }
+    }
+    func updateOperation(agentId: String, requestId: String, phase: String, message: String, retryable: Bool) async throws -> WorkspaceOperation {
+        try await perform { try await $0.updateOperation(agentId: agentId, requestId: requestId, phase: phase, message: message, retryable: retryable) }
+    }
+    func fetchConversations(agentId: String, query: String = "", archived: String = "active", deleted: String = "active", before: String? = nil) async throws -> RemoteRecord {
+        try await perform { try await $0.fetchConversations(agentId: agentId, query: query, archived: archived, deleted: deleted, before: before) }
+    }
+    func updateConversation(agentId: String, conversationId: String?, patch: RemoteRecord) async throws -> RemoteRecord {
+        try await perform { try await $0.updateConversation(agentId: agentId, conversationId: conversationId, patch: patch) }
+    }
+    func renameConnection(agentId: String, name: String) async throws { try await perform { try await $0.renameConnection(agentId: agentId, name: name) } }
+    func removeConnection(agentId: String) async throws { try await perform { try await $0.removeConnection(agentId: agentId) } }
+    func saveRecordState(agentId: String, kind: String, id: String, deleted: Bool) async throws -> WorkspaceRecordState {
+        try await perform { try await $0.saveRecordState(agentId: agentId, kind: kind, id: id, deleted: deleted) }
+    }
+    func fetchActivity() async throws -> RemoteRecord { try await perform { try await $0.fetchActivity() } }
+    func fetchAccount() async throws -> RemoteRecord { try await perform { try await $0.fetchAccount() } }
+    func resendVerification(email: String) async throws { _ = try await perform { try await $0.resendVerification(email: email) } }
+    func requestPasswordReset(email: String) async throws { _ = try await perform { try await $0.requestPasswordReset(email: email) } }
+    func changePassword(currentPassword: String, password: String) async throws -> RemoteRecord {
+        try await perform { try await $0.changePassword(currentPassword: currentPassword, password: password) }
+    }
+    func previewOnboarding(code: String) async throws -> RemoteRecord { try await perform { try await $0.previewOnboarding(code: code) } }
+    func approveOnboarding(code: String) async throws -> RemoteRecord { try await perform { try await $0.approveOnboarding(code: code) } }
+
     private func perform<T>(_ operation: (WorkspaceClient) async throws -> T) async throws -> T {
         let epoch = generation
         let active = client

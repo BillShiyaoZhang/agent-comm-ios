@@ -63,6 +63,7 @@ struct MainTabView: View {
                             sidebarButton("工作台", icon: "square.grid.2x2", tag: 0)
                             sidebarButton("对话", icon: "bubble.left.and.bubble.right", tag: 1)
                             sidebarButton("协作", icon: "person.2", tag: 2)
+                            sidebarButton("提醒", icon: "bell", tag: 3)
                         }
                         Section("我的 Agent") {
                             ForEach(store.connections) { agent in
@@ -80,6 +81,7 @@ struct MainTabView: View {
                     DashboardView().tabItem { Label("工作台", systemImage: "square.grid.2x2") }.tag(0)
                     MessagesView().tabItem { Label("对话", systemImage: "bubble.left.and.bubble.right") }.tag(1)
                     CollaborationView().tabItem { Label("协作", systemImage: "person.2") }.badge(store.pendingCount).tag(2)
+                    NotificationsView().tabItem { Label("提醒", systemImage: "bell") }.badge(Int(store.notificationCounts.number("unread"))).tag(3)
                 }
             }
         }
@@ -89,16 +91,20 @@ struct MainTabView: View {
             if store.demo {
                 let arguments = ProcessInfo.processInfo.arguments
                 if arguments.contains("--demo-messages") { store.tab = 1 }
-                if arguments.contains("--demo-collaboration") { store.tab = 2 }
+                if arguments.contains("--demo-collaboration") || arguments.contains("--demo-contacts") || arguments.contains("--demo-inbox") { store.tab = 2 }
+                if arguments.contains("--demo-notifications") { store.tab = 3 }
             }
             #endif
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
         .task(id: scenePhase) { if scenePhase == .active { await store.run() } else { store.saveDraft() } }
         .onChange(of: store.draft) { _, _ in store.saveDraft() }
+        .task(id: store.draft) {
+            do { try await Task.sleep(for: .milliseconds(800)); try Task.checkCancellation(); await store.syncDraft() } catch { }
+        }
     }
     @ViewBuilder private var selectedPage: some View {
-        switch store.tab { case 1: MessagesView(); case 2: CollaborationView(); default: DashboardView() }
+        switch store.tab { case 1: MessagesView(); case 2: CollaborationView(); case 3: NotificationsView(); default: DashboardView() }
     }
     private func sidebarButton(_ title: String, icon: String, tag: Int) -> some View {
         Button { store.tab = tag } label: {

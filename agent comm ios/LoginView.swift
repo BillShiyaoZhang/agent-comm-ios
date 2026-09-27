@@ -8,6 +8,7 @@ struct LoginView: View {
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var showRegister = false
+    @State private var helpMode: String?
     @FocusState private var focusedField: Field?
 
     private enum Field { case server, email, password }
@@ -89,6 +90,12 @@ struct LoginView: View {
                     .foregroundStyle(Color.brandPrimary)
                     .disabled(isLoading)
 
+                    HStack {
+                        Button("忘记密码") { openEmailHelp("reset") }
+                        Spacer()
+                        Button("重新发送验证邮件") { openEmailHelp("verify") }
+                    }.font(.subheadline).disabled(isLoading)
+
                     Label("账户属于当前工作区，切换地址后需要重新登录。", systemImage: "lock.shield")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -104,11 +111,17 @@ struct LoginView: View {
             .navigationDestination(isPresented: $showRegister) {
                 RegisterView(serverURL: serverUrl)
             }
+            .sheet(isPresented: Binding(get: { helpMode != nil }, set: { if !$0 { helpMode = nil } })) { EmailHelpView(mode: helpMode ?? "verify", initialEmail: email) }
         }
         .tint(.brandPrimary)
         .onAppear {
             if serverUrl.isEmpty { serverUrl = networkManager.baseUrl }
         }
+    }
+
+    private func openEmailHelp(_ mode: String) {
+        do { try networkManager.configureServer(serverUrl); serverUrl = networkManager.baseUrl; helpMode = mode }
+        catch { errorMessage = error.localizedDescription }
     }
 
     private func openRegistration() {
